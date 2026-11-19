@@ -1,3 +1,4 @@
+mod kafka;
 mod parser;
 mod source;
 
@@ -6,9 +7,12 @@ use std::{env, process::ExitCode, time::Duration};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
+use kafka::{KafkaConfig, Publisher};
 use parser::{MatchSnapshot, parse_match};
 
-const USAGE: &str = "usage: sport-stream <path-to-html>\n       sport-stream --url <http-url> [--poll-seconds <N> [--max-polls <N>]]";
+const USAGE: &str = "usage: sport-stream <path-to-html>
+       sport-stream --url <http-url> [--poll-seconds <N> [--max-polls <N>]
+                    [--kafka-brokers <host:port> --match-id <id>]]";
 
 #[derive(Debug, PartialEq, Eq)]
 enum Input {
@@ -18,6 +22,7 @@ enum Input {
         url: String,
         interval: Duration,
         max_polls: Option<u64>,
+        kafka: Option<KafkaConfig>,
     },
 }
 
@@ -35,32 +40,36 @@ fn positive(flag: &str, value: Option<String>) -> Result<u64, String> {
     }
 }
 
+fn text(flag: &str, value: Option<String>) -> Result<String, String> {
+    match value {
+        Some(v) if !v.trim().is_empty() => Ok(v),
+        Some(_) => Err(format!("{flag} must not be empty")),
+        None => Err(format!("{flag} requires a value\n{USAGE}")),
+    }
+}
+
+fn once<T>(slot: &mut Option<T>, flag: &str, value: T) -> Result<(), String> {
+    if slot.replace(value).is_some() {
+        return Err(format!("{flag} given more than once\n{USAGE}"));
+    }
+    Ok(())
+}
+
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Input, String> {
     let mut args = args.into_iter();
     let mut file = None;
     let mut url = None;
     let mut poll = None;
     let mut max_polls = None;
+    let mut brokers = None;
+    let mut match_id = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--url" => {
-                let value = args
-                    .next()
-                    .ok_or(format!("--url requires a value\n{USAGE}"))?;
-                if url.replace(value).is_some() {
-                    return Err(format!("--url given more than once\n{USAGE}"));
-                }
-            }
-            "--poll-seconds" => {
-                if poll.replace(positive(&arg, args.next())?).is_some() {
-                    return Err(format!("--poll-seconds given more than once\n{USAGE}"));
-                }
-            }
-            "--max-polls" => {
-                if max_polls.replace(positive(&arg, args.next())?).is_some() {
-                    return Err(format!("--max-polls given more than once\n{USAGE}"));
-                }
-            }
+            "--url" => once(&mut url, &arg, text(&arg, args.next())?)?,
+            "--poll-seconds" => once(&mut poll, &arg, positive(&arg, args.next())?)?,
+            "--max-polls" => once(&mut max_polls, &arg, positive(&arg, args.next())?)?,
+            "--kafka-brokers" => once(&mut brokers, &arg, text(&arg, args.next())?)?,
+            "--match-id" => once(&mut match_id, &arg, text(&arg, args.next())?)?,
             a if a.starts_with("--") => return Err(format!("unknown option {a}\n{USAGE}")),
             _ => {
                 if file.replace(arg.clone()).is_some() {
@@ -69,23 +78,40 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Input, String> {
             }
         }
     }
-    match (file, url, poll, max_polls) {
-        (None, None, None, None) => Err(USAGE.to_string()),
-        (Some(_), Some(_), ..) => Err(format!(
+    let has_poll_options =
+        poll.is_some() || max_polls.is_some() || brokers.is_some() || match_id.is_some();
+    match (file, url) {
+        (None, None) if !has_poll_options => Err(USAGE.to_string()),
+        (None, None) => Err(format!("polling options require --url\n{USAGE}")),
+        (Some(_), Some(_)) => Err(format!(
             "a file path cannot be combined with --url\n{USAGE}"
         )),
-        (Some(path), None, None, None) => Ok(Input::File(path)),
-        (Some(_), None, ..) => Err(format!("polling options require --url\n{USAGE}")),
-        (None, None, ..) => Err(format!("polling options require --url\n{USAGE}")),
-        (None, Some(url), None, None) => Ok(Input::Url(url)),
-        (None, Some(_), None, Some(_)) => {
-            Err(format!("--max-polls requires --poll-seconds\n{USAGE}"))
+        (Some(_), None) if has_poll_options => {
+            Err(format!("polling options require --url\n{USAGE}"))
         }
-        (None, Some(url), Some(secs), max_polls) => Ok(Input::Poll {
-            url,
-            interval: Duration::from_secs(secs),
-            max_polls,
-        }),
+        (Some(path), None) => Ok(Input::File(path)),
+        (None, Some(url)) if !has_poll_options => Ok(Input::Url(url)),
+        (None, Some(url)) => {
+            let secs = poll.ok_or(format!(
+                "--max-polls, --kafka-brokers and --match-id require --poll-seconds\n{USAGE}"
+            ))?;
+            let kafka = match (brokers, match_id) {
+                (Some(brokers), Some(match_id)) => Some(KafkaConfig { brokers, match_id }),
+                (None, None) => None,
+                (Some(_), None) => {
+                    return Err(format!("--kafka-brokers requires --match-id\n{USAGE}"));
+                }
+                (None, Some(_)) => {
+                    return Err(format!("--match-id requires --kafka-brokers\n{USAGE}"));
+                }
+            };
+            Ok(Input::Poll {
+                url,
+                interval: Duration::from_secs(secs),
+                max_polls,
+                kafka,
+            })
+        }
     }
 }
 
@@ -104,19 +130,33 @@ fn render_observation(
     serde_json::to_string(&observation).map_err(|e| format!("cannot serialize: {e}"))
 }
 
-async fn poll_once(client: &reqwest::Client, url: &str) -> Result<String, String> {
+async fn poll_once(
+    client: &reqwest::Client,
+    publisher: Option<&Publisher>,
+    url: &str,
+) -> Result<String, String> {
     let (html, observed_at) = source::fetch_url(client, url).await?;
     let snapshot = parse_match(&html).map_err(|e| format!("cannot parse {url}: {e}"))?;
+    if let Some(publisher) = publisher {
+        publisher.publish(&snapshot, observed_at).await?;
+    }
     render_observation(&snapshot, observed_at)
 }
 
 /// Polls sequentially: the next attempt starts `interval` after the previous one finished.
-async fn poll(url: &str, interval: Duration, max_polls: Option<u64>) -> Result<(), String> {
+/// With Kafka enabled, a line is printed only after the broker acknowledged the message.
+async fn poll(
+    url: &str,
+    interval: Duration,
+    max_polls: Option<u64>,
+    kafka: Option<KafkaConfig>,
+) -> Result<(), String> {
     let client = source::build_client()?;
+    let publisher = kafka.as_ref().map(Publisher::new).transpose()?;
     let (mut attempts, mut successes) = (0u64, 0u64);
     loop {
         attempts += 1;
-        match poll_once(&client, url).await {
+        match poll_once(&client, publisher.as_ref(), url).await {
             Ok(line) => {
                 successes += 1;
                 println!("{line}");
@@ -146,7 +186,8 @@ async fn run() -> Result<(), String> {
             url,
             interval,
             max_polls,
-        } => return poll(&url, interval, max_polls).await,
+            kafka,
+        } => return poll(&url, interval, max_polls, kafka).await,
     };
     let snapshot = parse_match(&html).map_err(|e| format!("cannot parse {origin}: {e}"))?;
     println!("{}", render(&snapshot)?);
@@ -198,7 +239,8 @@ mod tests {
             Ok(Input::Poll {
                 url: "http://x".into(),
                 interval: Duration::from_secs(2),
-                max_polls: Some(3)
+                max_polls: Some(3),
+                kafka: None
             })
         );
         assert_eq!(
@@ -206,9 +248,64 @@ mod tests {
             Ok(Input::Poll {
                 url: "http://x".into(),
                 interval: Duration::from_secs(5),
-                max_polls: None
+                max_polls: None,
+                kafka: None
             })
         );
+    }
+
+    #[test]
+    fn parses_kafka_args() {
+        assert_eq!(
+            parse_args(args(&[
+                "--url",
+                "http://x",
+                "--poll-seconds",
+                "1",
+                "--kafka-brokers",
+                "127.0.0.1:9092",
+                "--match-id",
+                "demo"
+            ])),
+            Ok(Input::Poll {
+                url: "http://x".into(),
+                interval: Duration::from_secs(1),
+                max_polls: None,
+                kafka: Some(KafkaConfig {
+                    brokers: "127.0.0.1:9092".into(),
+                    match_id: "demo".into()
+                }),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_bad_kafka_args() {
+        let base = ["--url", "http://x", "--poll-seconds", "1"];
+        for extra in [
+            &["--kafka-brokers", "b:9092"][..],
+            &["--match-id", "m"],
+            &["--kafka-brokers", "", "--match-id", "m"],
+            &["--kafka-brokers", "b:9092", "--match-id", " "],
+            &["--kafka-brokers", "b:9092", "--match-id"],
+        ] {
+            let mut v = args(&base);
+            v.extend(args(extra));
+            assert!(parse_args(v).is_err(), "{extra:?}");
+        }
+        // Kafka options without polling, or with a file path.
+        assert!(
+            parse_args(args(&[
+                "--url",
+                "http://x",
+                "--kafka-brokers",
+                "b",
+                "--match-id",
+                "m"
+            ]))
+            .is_err()
+        );
+        assert!(parse_args(args(&["a.html", "--kafka-brokers", "b", "--match-id", "m"])).is_err());
     }
 
     #[test]
