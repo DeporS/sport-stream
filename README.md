@@ -4,7 +4,7 @@ A Data Engineering portfolio project in Rust. The goal is to collect football
 match results, stats and odds, stream the observations through Kafka and store
 their history in PostgreSQL.
 
-This MVP parses HTML from a local file or an HTTP URL, can poll it, can publish observations to Kafka, and stores them in PostgreSQL with a consumer into a `MatchSnapshot` and prints it as JSON.
+This MVP parses HTML from a local file or an HTTP URL, can poll it, can publish observations to Kafka, stores them in PostgreSQL with a consumer, and serves the history over a read-only HTTP API into a `MatchSnapshot` and prints it as JSON.
 
 ## Run
 
@@ -155,6 +155,43 @@ does not change. It does not identify the same observation across a recreated
 topic, because a topic recreated from scratch can reuse the same offsets for
 different messages; clear the table (or `docker compose down -v`) when you
 reset the topic.
+
+### Read the history over HTTP
+
+The read-only `api` binary (Axum + SQLx) serves the stored observations. It
+reads `DATABASE_URL` and listens on `127.0.0.1:8080` by default
+(`--listen <host:port>` changes that):
+
+```sh
+export DATABASE_URL=postgres://sport:sport@127.0.0.1:5432/sport_stream
+cargo run --bin api
+
+# Observations, newest first (limit 1-200, default 50; unknown match -> [])
+curl "http://127.0.0.1:8080/matches/demo-lech-legia/observations?limit=10"
+
+# Latest known state
+curl "http://127.0.0.1:8080/matches/demo-lech-legia/state"
+
+# State as last observed at or before a given moment (404 if there is none)
+curl "http://127.0.0.1:8080/matches/demo-lech-legia/state?at=2026-11-19T13:31:31Z"
+```
+
+Example response:
+
+```json
+{"match_id":"demo-lech-legia","observed_at":"2026-11-19T13:31:30.079627Z","snapshot":{"home_team":"Lech Poznań","away_team":"Legia Warszawa","home_score":1,"away_score":0}}
+```
+
+Invalid `limit` or `at` gives `400`, database problems give a generic `500`
+(details are logged by the server). In URLs, encode `+` in an offset as `%2B`.
+Observations with the same `observed_at` are ordered by their Kafka position
+(newest message first).
+
+`at` means *the state last observed by the collector up to that moment*, not
+the true state of the match at that moment. The collector only sees the match
+when it polls: if a goal was scored between two polls, the API cannot know its
+exact time and returns the older score until the first poll that saw the new
+one. Timestamps are stored with microsecond precision.
 
 ## Test
 
