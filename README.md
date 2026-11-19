@@ -193,6 +193,37 @@ when it polls: if a goal was scored between two polls, the API cannot know its
 exact time and returns the older score until the first poll that saw the new
 one. Timestamps are stored with microsecond precision.
 
+## One-command demo
+
+```sh
+./scripts/demo.sh
+```
+
+The script starts Kafka and PostgreSQL in its own Compose project
+(`sport-stream-demo`), serves a deterministic HTML page (scores `0:0`, `1:0`,
+`2:1` for the first three collector requests; `/healthz` does not advance the
+match), runs collector → Kafka → consumer → PostgreSQL, starts the API and
+checks the history (`[2:1, 1:0, 0:0]`), the latest state (`2:1`) and the state
+at a moment between the second and third observation (`1:0`, computed from the
+real `observed_at` values). Example output:
+
+```
+history (newest first): ['2:1', '1:0', '0:0']
+latest state:           2:1
+state at 2026-11-19T13:37:07.749193Z: 1:0
+RESULT: OK
+```
+
+It exits non-zero on any mismatch. It always cleans up (success, error, Ctrl+C):
+it stops only the processes it started and removes only the Compose project
+`sport-stream-demo` with its volume. If port 8000, 8080, 9092 or 5432 is in use
+it exits with a message and stops nothing.
+
+Requirements (WSL Ubuntu): Docker with the Compose plugin (and a running
+daemon, e.g. Docker Desktop with WSL integration), a Rust toolchain (`cargo`),
+`python3` and `curl`. The first run downloads the Kafka and PostgreSQL images
+and compiles the project.
+
 ## Test
 
 ```sh

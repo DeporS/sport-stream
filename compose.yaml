@@ -4,7 +4,6 @@
 services:
   kafka:
     image: apache/kafka:3.9.1
-    container_name: sport-stream-kafka
     ports:
       - "127.0.0.1:9092:9092"
     environment:
@@ -26,7 +25,6 @@ services:
 
   postgres:
     image: postgres:17.6
-    container_name: sport-stream-postgres
     ports:
       - "127.0.0.1:5432:5432"
     environment:
