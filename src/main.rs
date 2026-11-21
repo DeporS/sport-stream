@@ -3,6 +3,7 @@ mod kafka;
 mod parser;
 mod source;
 mod stats;
+mod stats_graphql;
 
 use std::{env, process::ExitCode, time::Duration};
 
@@ -20,6 +21,9 @@ const USAGE: &str = "usage: sport-stream <path-to-html>
        Flashscore core feed instead of HTML (default: --format html)
        sport-stream <core-feed-file> --format flashscore --home-team <name> --away-team <name>
                     --stats-file <stats-feed-file>   (local replay: score + statistics as one JSON)
+       sport-stream <core-feed-file> --format flashscore --home-team <name> --away-team <name>
+                    --stats-file <graphql-response.json> --stats-format json
+                    --home-team-id <id> --away-team-id <id>   (statistics in the JSON format)
        sport-stream --url <core-url> --poll-seconds <N> --format flashscore ...
                     --stats-url <stats-feed-url>     (also fetch statistics in every poll)";
 
@@ -45,10 +49,35 @@ impl Format {
     }
 }
 
+/// Format of the statistics feed read with `--stats-file`.
+#[derive(Debug, PartialEq, Eq)]
+enum StatsFormat {
+    /// Historical text feed (`SE`/`SG`/`SH`/`SI`).
+    Text,
+    /// GraphQL JSON response; sides are chosen by explicit team ids.
+    Json {
+        home_team_id: String,
+        away_team_id: String,
+    },
+}
+
+impl StatsFormat {
+    fn parse(&self, body: &str) -> Result<Vec<StatRecord>, ParseError> {
+        match self {
+            Self::Text => stats::parse_stats_feed(body),
+            Self::Json {
+                home_team_id,
+                away_team_id,
+            } => stats_graphql::parse_stats_json(body, home_team_id, away_team_id),
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct Cli {
     input: Input,
     format: Format,
+    stats_format: StatsFormat,
     /// Local replay: statistics feed read from a file (file input only).
     stats_file: Option<String>,
     /// Polling: statistics feed fetched together with the score in every attempt.
@@ -61,6 +90,7 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
     let mut args = args.into_iter();
     let (mut format, mut home, mut away) = (None, None, None);
     let (mut stats_file, mut stats_url) = (None, None);
+    let (mut stats_format, mut home_id, mut away_id) = (None, None, None);
     let mut rest = Vec::new();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -69,6 +99,9 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
             "--away-team" => once(&mut away, &arg, text(&arg, args.next())?)?,
             "--stats-file" => once(&mut stats_file, &arg, text(&arg, args.next())?)?,
             "--stats-url" => once(&mut stats_url, &arg, text(&arg, args.next())?)?,
+            "--stats-format" => once(&mut stats_format, &arg, text(&arg, args.next())?)?,
+            "--home-team-id" => once(&mut home_id, &arg, text(&arg, args.next())?)?,
+            "--away-team-id" => once(&mut away_id, &arg, text(&arg, args.next())?)?,
             _ => rest.push(arg),
         }
     }
@@ -111,9 +144,43 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
             "--stats-url needs --url with --poll-seconds and --format flashscore\n{USAGE}"
         ));
     }
+    let stats_format = match (stats_format.as_deref(), home_id, away_id) {
+        (None | Some("text"), None, None) => StatsFormat::Text,
+        (None | Some("text"), _, _) => {
+            return Err(format!(
+                "--home-team-id and --away-team-id require --stats-format json\n{USAGE}"
+            ));
+        }
+        (Some("json"), Some(home), Some(away)) => {
+            let (home_team_id, away_team_id) = (home.trim().to_string(), away.trim().to_string());
+            if home_team_id == away_team_id {
+                return Err("--home-team-id and --away-team-id must differ".to_string());
+            }
+            if stats_file.is_none() {
+                return Err(format!(
+                    "--stats-format json is only supported with --stats-file (local replay)\n{USAGE}"
+                ));
+            }
+            StatsFormat::Json {
+                home_team_id,
+                away_team_id,
+            }
+        }
+        (Some("json"), _, _) => {
+            return Err(format!(
+                "--stats-format json requires --home-team-id and --away-team-id\n{USAGE}"
+            ));
+        }
+        (Some(other), _, _) => {
+            return Err(format!(
+                "unknown statistics format {other:?} (expected text or json)\n{USAGE}"
+            ));
+        }
+    };
     Ok(Cli {
         input,
         format,
+        stats_format,
         stats_file,
         stats_url,
     })
@@ -346,6 +413,7 @@ async fn run() -> Result<(), String> {
     let Cli {
         input,
         format,
+        stats_format,
         stats_file,
         stats_url,
     } = parse_cli(env::args().skip(1))?;
@@ -377,7 +445,8 @@ async fn run() -> Result<(), String> {
         .map_err(|e| format!("cannot parse {origin}: {e}"))?;
     if let Some(stats_path) = stats_file {
         let stats_body = source::read_file(&stats_path)?;
-        let statistics = stats::parse_stats_feed(&stats_body)
+        let statistics = stats_format
+            .parse(&stats_body)
             .map_err(|e| format!("cannot parse {stats_path}: {e}"))?;
         println!("{}", render_report(&snapshot, &statistics)?);
         return Ok(());
@@ -425,6 +494,7 @@ mod tests {
             Cli {
                 input: Input::File("a.html".into()),
                 format: Format::Html,
+                stats_format: StatsFormat::Text,
                 stats_file: None,
                 stats_url: None
             }
@@ -434,6 +504,7 @@ mod tests {
             format,
             stats_file,
             stats_url,
+            ..
         } = parse_cli(args(&[
             "--url",
             "http://x",
@@ -499,6 +570,115 @@ mod tests {
         assert!(with(&["core.txt", "--stats-file"]).is_err());
         assert!(with(&["core.txt", "--stats-file", "a", "--stats-file", "b"]).is_err());
         assert!(parse_cli(args(&["core.txt", "--stats-file", "s"])).is_err());
+    }
+
+    #[test]
+    fn stats_format_json_needs_ids_and_a_stats_file() {
+        let flash = [
+            "--format",
+            "flashscore",
+            "--home-team",
+            "A",
+            "--away-team",
+            "B",
+        ];
+        let with = |extra: &[&str]| {
+            let all: Vec<&str> = flash.iter().chain(extra).copied().collect();
+            parse_cli(args(&all))
+        };
+        let cli = with(&[
+            "core.txt",
+            "--stats-file",
+            "s.json",
+            "--stats-format",
+            "json",
+            "--home-team-id",
+            " h1 ",
+            "--away-team-id",
+            "a1",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.stats_format,
+            StatsFormat::Json {
+                home_team_id: "h1".into(),
+                away_team_id: "a1".into()
+            }
+        );
+        // text stays the default and may be chosen explicitly
+        assert_eq!(
+            with(&["core.txt", "--stats-file", "s"])
+                .unwrap()
+                .stats_format,
+            StatsFormat::Text
+        );
+        assert_eq!(
+            with(&["core.txt", "--stats-file", "s", "--stats-format", "text"])
+                .unwrap()
+                .stats_format,
+            StatsFormat::Text
+        );
+        for bad in [
+            // ids missing / one id / same ids / ids without json / unknown format
+            &["core.txt", "--stats-file", "s", "--stats-format", "json"][..],
+            &[
+                "core.txt",
+                "--stats-file",
+                "s",
+                "--stats-format",
+                "json",
+                "--home-team-id",
+                "h",
+            ],
+            &[
+                "core.txt",
+                "--stats-file",
+                "s",
+                "--stats-format",
+                "json",
+                "--home-team-id",
+                "x",
+                "--away-team-id",
+                "x",
+            ],
+            &[
+                "core.txt",
+                "--stats-file",
+                "s",
+                "--home-team-id",
+                "h",
+                "--away-team-id",
+                "a",
+            ],
+            &["core.txt", "--stats-file", "s", "--stats-format", "xml"],
+            // json is a local replay only
+            &[
+                "--url",
+                "u",
+                "--poll-seconds",
+                "2",
+                "--stats-url",
+                "s",
+                "--stats-format",
+                "json",
+                "--home-team-id",
+                "h",
+                "--away-team-id",
+                "a",
+            ],
+            &[
+                "core.txt",
+                "--stats-format",
+                "json",
+                "--home-team-id",
+                "h",
+                "--away-team-id",
+                "a",
+            ],
+            &["core.txt", "--stats-file", "s", "--stats-format"],
+        ] {
+            assert!(with(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

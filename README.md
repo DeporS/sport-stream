@@ -349,6 +349,40 @@ hand-written old-format message. It checks the latest reading (`1.20`), a time b
 readings (`0.42`), a time before the first reading (`404`), that the newer score-only
 observation keeps the last statistics available, and that the old message is stored.
 
+#### Statistics in the GraphQL JSON format (local replay)
+
+The current Flashscore page loads statistics as a GraphQL JSON response, not as the historical
+text feed. `--stats-format json` reads that format from `--stats-file` (local replay only: not
+available with `--stats-url`, so nothing in the Kafka/PostgreSQL/API path changes). The
+response has no home/away marker and no names, so the team ids are explicit:
+
+```sh
+cargo run -- fixtures/flashscore/core_2-1.txt --format flashscore \
+  --home-team "Lech Poznań" --away-team "Legia Warszawa" \
+  --stats-file fixtures/flashscore/stats_graphql.json --stats-format json \
+  --home-team-id synthHome --away-team-id synthAway
+```
+
+`fixtures/flashscore/stats_graphql.json` is **synthetic**, shaped after a response observed in a
+browser (`data.findEventById.teamStats.entries[]` with `typeId`, `value`, `subValue`, `rawValue`,
+`eventStageId`, `teamId`); the ids are made up. Entries are grouped by `(eventStageId, typeId)`
+in order of first appearance and assigned to `home`/`away` by `teamId`:
+
+- `name` is the `typeId` (`expected_goals`, ...); the source sends no display names.
+- `event_stage_id` keeps the numeric `eventStageId`. Its meaning is not documented by the
+  source, so `period` stays `null` and no period name is guessed. Here `null` means "name
+  unknown" (the stage is in `event_stage_id`), unlike the text format where it means "row before
+  any `SE`". Stages are never merged: in the observed response stages `74` and `12` carry
+  identical numbers for every metric, yet they stay two separate records per metric (88 records
+  from 176 entries), because nothing says that they are the same period.
+- `value` (the displayed text) is `raw` and is interpreted like in the text format
+  (`"0.34"` decimal, `"36%"` percent, `"0/2"` fraction, `"0"` a real zero). `rawValue` (e.g.
+  `"0.3389"`) is kept as `raw_value` and `subValue` (e.g. `"(80%)"`) as `sub_value`, both verbatim
+  and not interpreted. `null` or blank `value` is `missing`.
+- A side without an entry stays `missing`. Identical duplicate entries collapse; conflicting ones,
+  an unknown `teamId` or a malformed entry are errors, not silently overwritten.
+- A GraphQL `errors` list, missing/`null`/empty `entries`, empty payload or invalid JSON are errors.
+
 ## Test
 
 ```sh

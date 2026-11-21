@@ -16,8 +16,19 @@ pub enum ParseError {
     MissingField(&'static str),
     InvalidScore(String),
     EmptyPayload,
-    InvalidField { field: &'static str, value: String },
-    AmbiguousField { field: &'static str },
+    InvalidField {
+        field: &'static str,
+        value: String,
+    },
+    AmbiguousField {
+        field: &'static str,
+    },
+    /// The payload is not valid JSON.
+    Json(String),
+    /// The source answered with an `errors` list instead of (or next to) data.
+    SourceErrors(String),
+    /// One statistics entry is malformed (wrong type, unknown team, conflicting duplicate...).
+    InvalidEntry(String),
 }
 
 impl fmt::Display for ParseError {
@@ -38,6 +49,9 @@ impl fmt::Display for ParseError {
                     "ambiguous {field}: the payload contains conflicting values"
                 )
             }
+            Self::Json(e) => write!(f, "invalid JSON: {e}"),
+            Self::SourceErrors(e) => write!(f, "the source reported errors: {e}"),
+            Self::InvalidEntry(e) => write!(f, "invalid statistics entry: {e}"),
         }
     }
 }

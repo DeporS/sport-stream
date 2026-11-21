@@ -1,0 +1,36 @@
+{
+  "data": {
+    "findEventById": {
+      "__typename": "TeamStatsEvent",
+      "shouldUpdate": true,
+      "teamStats": {
+        "__typename": "TeamStats",
+        "entries": [
+          {"__typename": "TeamStatsEntry", "typeId": "expected_goals", "value": "0.34", "subValue": null, "rawValue": "0.3389", "eventStageId": 74, "teamId": "synthHome"},
+          {"__typename": "TeamStatsEntry", "typeId": "ball_possession", "value": "36%", "subValue": null, "rawValue": "36.0", "eventStageId": 74, "teamId": "synthHome"},
+          {"__typename": "TeamStatsEntry", "typeId": "red_cards", "value": "0", "subValue": null, "rawValue": "0.0", "eventStageId": 74, "teamId": "synthHome"},
+          {"__typename": "TeamStatsEntry", "typeId": "calculated_completed_passes", "value": "160", "subValue": "(80%)", "rawValue": "160.0", "eventStageId": 74, "teamId": "synthHome"},
+          {"__typename": "TeamStatsEntry", "typeId": "calculated_goalkeeper_saves", "value": "0/2", "subValue": null, "rawValue": "0.0", "eventStageId": 74, "teamId": "synthHome"},
+          {"__typename": "TeamStatsEntry", "typeId": "goals_prevented", "value": "-0.27", "subValue": null, "rawValue": "-0.2654", "eventStageId": 74, "teamId": "synthHome"},
+          {"__typename": "TeamStatsEntry", "typeId": "brand_new_metric", "value": "n/a", "subValue": null, "rawValue": null, "eventStageId": 74, "teamId": "synthHome"},
+          {"__typename": "TeamStatsEntry", "typeId": "offsides", "value": "2", "subValue": null, "rawValue": "2.0", "eventStageId": 74, "teamId": "synthHome"},
+          {"__typename": "TeamStatsEntry", "typeId": "expected_goals", "value": "0.20", "subValue": null, "rawValue": "0.2011", "eventStageId": 12, "teamId": "synthHome"},
+          {"__typename": "TeamStatsEntry", "typeId": "expected_goals", "value": "1.23", "subValue": null, "rawValue": "1.2322", "eventStageId": 74, "teamId": "synthAway"},
+          {"__typename": "TeamStatsEntry", "typeId": "ball_possession", "value": "64%", "subValue": null, "rawValue": "64.0", "eventStageId": 74, "teamId": "synthAway"},
+          {"__typename": "TeamStatsEntry", "typeId": "red_cards", "value": "0", "subValue": null, "rawValue": "0.0", "eventStageId": 74, "teamId": "synthAway"},
+          {"__typename": "TeamStatsEntry", "typeId": "calculated_completed_passes", "value": "318", "subValue": "(92%)", "rawValue": "318.0", "eventStageId": 74, "teamId": "synthAway"},
+          {"__typename": "TeamStatsEntry", "typeId": "calculated_goalkeeper_saves", "value": "0/1", "subValue": null, "rawValue": "0.0", "eventStageId": 74, "teamId": "synthAway"},
+          {"__typename": "TeamStatsEntry", "typeId": "goals_prevented", "value": "-0.56", "subValue": null, "rawValue": "-0.5588", "eventStageId": 74, "teamId": "synthAway"},
+          {"__typename": "TeamStatsEntry", "typeId": "brand_new_metric", "value": "4", "subValue": null, "rawValue": "4.0", "eventStageId": 74, "teamId": "synthAway"},
+          {"__typename": "TeamStatsEntry", "typeId": "offsides", "value": null, "subValue": null, "rawValue": null, "eventStageId": 74, "teamId": "synthAway"},
+          {"__typename": "TeamStatsEntry", "typeId": "expected_goals", "value": "1.02", "subValue": null, "rawValue": "1.0204", "eventStageId": 12, "teamId": "synthAway"},
+          {"__typename": "TeamStatsEntry", "typeId": "touches_in_opposition_box", "value": "12", "subValue": null, "rawValue": "12.0", "eventStageId": 12, "teamId": "synthAway"}
+        ],
+        "subscriptionSubjects": {
+          "__typename": "SubscriptionSubjects",
+          "updateTeamStatsSubscriptionSubjects": ["/fsds/changes/dtsu/event/teamStats/101/synthEvent"]
+        }
+      }
+    }
+  }
+}

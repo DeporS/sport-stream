@@ -36,11 +36,18 @@ pub enum ValueKind {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct StatValue {
+    /// The displayed value as sent (`value` in the JSON format); `None` when absent or blank.
     pub raw: Option<String>,
     pub kind: ValueKind,
     pub value: Option<Number>,
     pub numerator: Option<u64>,
     pub denominator: Option<u64>,
+    /// JSON format only: the more precise `rawValue` (e.g. `"0.3389"` next to `"0.34"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_value: Option<String>,
+    /// JSON format only: the `subValue` text (e.g. `"(80%)"`), kept verbatim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sub_value: Option<String>,
 }
 
 /// One statistics response: its records and when the collector received it.
@@ -52,9 +59,14 @@ pub struct StatisticsReading {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct StatRecord {
-    /// Value of the last `SE` seen before this row; `None` if there was none.
+    /// Text format: value of the last `SE` seen before this row; `None` if there was none.
+    /// JSON format: always `None`, the stage is only known by its numeric id.
     pub period: Option<String>,
-    /// Original `SG` text.
+    /// JSON format only: `eventStageId`. Its meaning is not documented by the source, so it is
+    /// kept as an id and never turned into a period name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_stage_id: Option<i64>,
+    /// Text format: original `SG` text. JSON format: `typeId`.
     pub name: String,
     pub home: StatValue,
     pub away: StatValue,
@@ -133,6 +145,8 @@ pub fn classify(raw: Option<&str>) -> StatValue {
         value: None,
         numerator: None,
         denominator: None,
+        raw_value: None,
+        sub_value: None,
     };
     let Some(s) = raw else { return v };
     if let Some((kind, n)) = plain_number(s) {
@@ -193,6 +207,7 @@ pub fn parse_stats_feed(payload: &str) -> Result<Vec<StatRecord>, ParseError> {
             Some("") => return Err(ParseError::MissingField("statistic name (SG)")),
             Some(name) => records.push(StatRecord {
                 period: period.clone(),
+                event_stage_id: None,
                 name: name.to_string(),
                 home: classify(home),
                 away: classify(away),
