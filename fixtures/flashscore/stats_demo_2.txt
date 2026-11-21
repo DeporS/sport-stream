@@ -1,0 +1,2 @@
+SE÷Match¬~SG÷Expected goals (xG)¬SH÷1.20¬SI÷0.35¬~SG÷Ball possession¬SH÷55%¬SI÷45%¬~SG÷Crosses¬SH÷75% (18/24)¬SI÷33% (4/12)¬~SG÷Offsides¬SH÷3¬SI÷¬~SG÷Red cards¬SH÷0¬SI÷0¬~SG÷Dribbles¬SH÷n/a¬SI÷2¬~
+SE÷1st Half¬~SG÷Expected goals (xG)¬SH÷1.20¬SI÷0.35¬~

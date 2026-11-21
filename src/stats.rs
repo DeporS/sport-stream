@@ -11,6 +11,7 @@
 //! here all periods are kept, a missing value is `null` (never 0), and text that
 //! is not clearly a number is kept verbatim.
 
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Number;
 
@@ -40,6 +41,13 @@ pub struct StatValue {
     pub value: Option<Number>,
     pub numerator: Option<u64>,
     pub denominator: Option<u64>,
+}
+
+/// One statistics response: its records and when the collector received it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct StatisticsReading {
+    pub observed_at: DateTime<Utc>,
+    pub records: Vec<StatRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

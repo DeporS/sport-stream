@@ -9,6 +9,7 @@ use rdkafka::{
 use serde::Serialize;
 
 use crate::parser::MatchSnapshot;
+use crate::stats::StatisticsReading;
 
 pub const TOPIC: &str = "sport.match.observations.v1";
 const SCHEMA_VERSION: u32 = 1;
@@ -28,18 +29,24 @@ struct KafkaObservation<'a> {
     match_id: &'a str,
     observed_at: DateTime<Utc>,
     snapshot: &'a MatchSnapshot,
+    /// Optional and additive (schema_version stays 1): omitted when there are no
+    /// statistics, so a score-only message is byte-for-byte the old format.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    statistics: Option<&'a StatisticsReading>,
 }
 
 pub fn render_message(
     match_id: &str,
     snapshot: &MatchSnapshot,
     observed_at: DateTime<Utc>,
+    statistics: Option<&StatisticsReading>,
 ) -> Result<String, String> {
     serde_json::to_string(&KafkaObservation {
         schema_version: SCHEMA_VERSION,
         match_id,
         observed_at,
         snapshot,
+        statistics,
     })
     .map_err(|e| format!("cannot serialize Kafka message: {e}"))
 }
@@ -72,8 +79,9 @@ impl Publisher {
         &self,
         snapshot: &MatchSnapshot,
         observed_at: DateTime<Utc>,
+        statistics: Option<&StatisticsReading>,
     ) -> Result<(), String> {
-        let payload = render_message(&self.match_id, snapshot, observed_at)?;
+        let payload = render_message(&self.match_id, snapshot, observed_at, statistics)?;
         let record = FutureRecord::to(TOPIC)
             .key(&self.match_id)
             .payload(&payload);
@@ -101,8 +109,38 @@ mod tests {
             .unwrap()
             .to_utc();
         assert_eq!(
-            render_message("demo", &snap, at).unwrap(),
+            render_message("demo", &snap, at, None).unwrap(),
             r#"{"schema_version":1,"match_id":"demo","observed_at":"2026-01-02T03:04:05Z","snapshot":{"home_team":"A","away_team":"B","home_score":1,"away_score":0}}"#
         );
+    }
+
+    #[test]
+    fn statistics_are_an_additive_optional_field() {
+        let snap = MatchSnapshot {
+            home_team: "A".into(),
+            away_team: "B".into(),
+            home_score: 1,
+            away_score: 0,
+        };
+        let at = DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+            .unwrap()
+            .to_utc();
+        let stats_at = at + chrono::Duration::seconds(1);
+        let reading = StatisticsReading {
+            observed_at: stats_at,
+            records: crate::stats::parse_stats_feed("SE÷Match¬~SG÷Fouls¬SH÷0¬SI÷¬~").unwrap(),
+        };
+        let json = render_message("demo", &snap, at, Some(&reading)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["schema_version"], 1);
+        assert_eq!(v["statistics"]["observed_at"], "2026-01-02T03:04:06Z");
+        assert_eq!(v["statistics"]["records"][0]["home"]["value"], 0);
+        assert!(v["statistics"]["records"][0]["away"]["raw"].is_null());
+        // Everything else is identical to the score-only message.
+        let mut without = v.clone();
+        without.as_object_mut().unwrap().remove("statistics");
+        let plain: serde_json::Value =
+            serde_json::from_str(&render_message("demo", &snap, at, None).unwrap()).unwrap();
+        assert_eq!(without, plain);
     }
 }

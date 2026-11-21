@@ -2,20 +2,29 @@
 # Repeatable sport-stream demo: HTML -> collector -> Kafka -> consumer -> PostgreSQL -> API.
 # Uses its own Docker Compose project (sport-stream-demo); it never touches other containers.
 #
-# Usage: scripts/demo.sh [html|flashscore]   (default: html)
+# Usage: scripts/demo.sh [html|flashscore|stats]   (default: html)
 #   html        replays a synthetic HTML page
 #   flashscore  replays a synthetic Flashscore core feed (offline, nothing is sent to Flashscore)
+#   stats       flashscore replay with statistics: xG 0.42, then 1.20, then a poll whose statistics
+#               request fails (score only), plus one hand-written score-only message in the
+#               old format; checks GET /matches/{id}/statistics (offline, nothing is sent to Flashscore)
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
 MODE=${1:-html}
+EXPECTED_MESSAGES=3
 case "$MODE" in
   html) SOURCE_PATH=match.html; COLLECTOR_FORMAT=() ;;
   flashscore)
     SOURCE_PATH=feed/dc_1_demo
     COLLECTOR_FORMAT=(--format flashscore --home-team "Lech Poznań" --away-team "Legia Warszawa") ;;
-  *) printf 'usage: %s [html|flashscore]\n' "$0" >&2; exit 2 ;;
+  stats)
+    SOURCE_PATH=feed/dc_1_demo
+    COLLECTOR_FORMAT=(--format flashscore --home-team "Lech Poznań" --away-team "Legia Warszawa"
+      --stats-url "http://127.0.0.1:8000/feed/df_st_demo")
+    EXPECTED_MESSAGES=4 ;;
+  *) printf 'usage: %s [html|flashscore|stats]\n' "$0" >&2; exit 2 ;;
 esac
 
 PROJECT=sport-stream-demo
@@ -113,8 +122,16 @@ log "collecting three observations (mode: $MODE)"
   --kafka-brokers "127.0.0.1:$KAFKA_PORT" --match-id "$MATCH_ID" >"$WORK/collector.log" 2>&1 \
   || die "collector failed"
 
+if [ "$MODE" = stats ]; then
+  log "publishing one score-only message in the old format (another match)"
+  LEGACY='{"schema_version":1,"match_id":"demo-legacy","observed_at":"2026-01-02T03:04:05Z","snapshot":{"home_team":"Old Home","away_team":"Old Away","home_score":3,"away_score":2}}'
+  printf '%s\n' "$LEGACY" | compose exec -T kafka /opt/kafka/bin/kafka-console-producer.sh \
+    --bootstrap-server localhost:9092 --topic sport.match.observations.v1 >"$WORK/legacy-producer.log" 2>&1 \
+    || die "cannot publish the old-format message"
+fi
+
 log "consuming into PostgreSQL"
-timeout 60 "$BIN/consumer" --group-id "demo-$$-$(date +%s)" --max-messages 3 >"$WORK/consumer.log" 2>&1 \
+timeout 60 "$BIN/consumer" --group-id "demo-$$-$(date +%s)" --max-messages "$EXPECTED_MESSAGES" >"$WORK/consumer.log" 2>&1 \
   || die "consumer failed"
 
 log "starting API on :$API_PORT"
@@ -152,4 +169,84 @@ print(f"state at {os.environ['AT']}: {past}")
 ok = history == ["2:1", "1:0", "0:0"] and latest == "2:1" and past == "1:0"
 print("RESULT:", "OK" if ok else "MISMATCH")
 sys.exit(0 if ok else 1)
+PY
+
+# --- statistics (stats mode only) --------------------------------------------
+[ "$MODE" = stats ] || exit 0
+
+log "checking statistics"
+# The statistics reading times as stored (the collector's observed_at of the statistics responses).
+STAT_TIMES=$(compose exec -T postgres psql -U sport -d sport_stream -Atc \
+  "SELECT to_char(statistics_observed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')
+     FROM match_observations
+    WHERE match_id = '$MATCH_ID' AND statistics IS NOT NULL ORDER BY statistics_observed_at") \
+  || die "cannot read statistics times from PostgreSQL"
+read -r T1 T2 EXTRA <<<"$(printf '%s' "$STAT_TIMES" | tr '\n' ' ')"
+[ -n "${T1:-}" ] && [ -n "${T2:-}" ] && [ -z "${EXTRA:-}" ] || die "expected exactly two statistics readings, got: $STAT_TIMES"
+
+read -r MID BEFORE <<<"$(T1="$T1" T2="$T2" python3 - <<'PY'
+import os
+from datetime import datetime, timedelta
+p = lambda v: datetime.fromisoformat(v.replace("Z", "+00:00"))
+f = lambda d: d.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+t1, t2 = p(os.environ["T1"]), p(os.environ["T2"])
+print(f(t1 + (t2 - t1) / 2), f(t1 - timedelta(seconds=1)))
+PY
+)"
+
+STATS="$API/statistics"
+code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
+LATEST_STATS=$(curl -sf "$STATS") || die "latest statistics request failed"
+MID_STATS=$(curl -sf "$STATS?at=$MID") || die "statistics between the readings failed"
+AT_T1_STATS=$(curl -sf "$STATS?at=$T1") || die "statistics at the first reading failed"
+BEFORE_CODE=$(code "$STATS?at=$BEFORE")
+BAD_CODE=$(code "$STATS?at=yesterday")
+NO_SUCH_CODE=$(code "http://127.0.0.1:$API_PORT/matches/no-such-match/statistics")
+LEGACY_STATE=$(curl -sf "http://127.0.0.1:$API_PORT/matches/demo-legacy/state") || die "old-format match not stored"
+LEGACY_STATS_CODE=$(code "http://127.0.0.1:$API_PORT/matches/demo-legacy/statistics")
+
+grep -q "statistics skipped" "$WORK/collector.log" || die "collector did not report the failed statistics request"
+echo "collector stderr:   $(grep 'statistics skipped' "$WORK/collector.log" | head -1)"
+echo "at=$BEFORE:  HTTP $BEFORE_CODE $(curl -s "$STATS?at=$BEFORE")"
+echo "at=yesterday:       HTTP $BAD_CODE $(curl -s "$STATS?at=yesterday")"
+echo "xG at $MID: $(printf '%s' "$MID_STATS" | python3 -c 'import json,sys; r=[r for r in json.load(sys.stdin)["statistics"] if r["name"]=="Expected goals (xG)"][0]; print(r["home"]["raw"], "(home)")')"
+echo "latest statistics:  $(printf '%s' "$LATEST_STATS" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(json.dumps({k: d[k] for k in ("match_id","observed_at","statistics_observed_at")}), "records:", len(d["statistics"]))')"
+echo "latest xG record:   $(printf '%s' "$LATEST_STATS" | python3 -c 'import json,sys; print(json.dumps([r for r in json.load(sys.stdin)["statistics"] if r["name"]=="Expected goals (xG)"][0]))')"
+
+HISTORY="$HISTORY" LATEST="$LATEST" LATEST_STATS="$LATEST_STATS" MID_STATS="$MID_STATS" \
+AT_T1_STATS="$AT_T1_STATS" LEGACY_STATE="$LEGACY_STATE" T1="$T1" T2="$T2" MID="$MID" BEFORE="$BEFORE" \
+BEFORE_CODE="$BEFORE_CODE" BAD_CODE="$BAD_CODE" NO_SUCH_CODE="$NO_SUCH_CODE" LEGACY_STATS_CODE="$LEGACY_STATS_CODE" \
+python3 - <<'PY'
+import json, os, sys
+e = os.environ
+load = lambda k: json.loads(e[k])
+xg = lambda d, period="Match": next(r for r in d["statistics"] if r["name"] == "Expected goals (xG)" and r["period"] == period)
+rec = lambda d, name: next(r for r in d["statistics"] if r["name"] == name)
+latest, mid, at_t1 = load("LATEST_STATS"), load("MID_STATS"), load("AT_T1_STATS")
+history = load("HISTORY")          # newest first: 2:1 (no statistics), 1:0, 0:0
+state = load("LATEST")
+legacy = load("LEGACY_STATE")
+sc = lambda o: f'{o["snapshot"]["home_score"]}:{o["snapshot"]["away_score"]}'
+
+checks = {
+  "latest statistics xG home is 1.20 (raw '1.20')": xg(latest)["home"]["value"] == 1.2 and xg(latest)["home"]["raw"] == "1.20",
+  "latest statistics time is the second reading": latest["statistics_observed_at"].rstrip("Z")[:26] == e["T2"].rstrip("Z")[:26],
+  f"at={e['MID']} (between readings) gives 0.42": xg(mid)["home"]["value"] == 0.42,
+  "at=<first reading> gives 0.42 (inclusive)": xg(at_t1)["home"]["value"] == 0.42,
+  f"at={e['BEFORE']} (before the first reading) is 404": e["BEFORE_CODE"] == "404",
+  "at=yesterday is 400": e["BAD_CODE"] == "400",
+  "unknown match is 404": e["NO_SUCH_CODE"] == "404",
+  "newest observation is score-only (2:1) yet statistics stay available": sc(state) == "2:1" and latest["observed_at"] == history[1]["observed_at"] and latest["observed_at"] < history[0]["observed_at"],
+  "periods are kept (xG in Match and 1st Half)": xg(latest, "1st Half")["home"]["value"] == 1.2,
+  "ordered list with all periods": [r["period"] for r in latest["statistics"]] == ["Match"] * 6 + ["1st Half"],
+  "missing / zero / n/a stay distinct": (rec(latest, "Offsides")["away"]["raw"] is None and rec(latest, "Offsides")["away"]["kind"] == "missing"
+      and rec(latest, "Red cards")["home"]["raw"] == "0" and rec(latest, "Red cards")["home"]["value"] == 0
+      and rec(latest, "Dribbles")["home"]["raw"] == "n/a" and rec(latest, "Dribbles")["home"]["kind"] == "text"),
+  "75% (18/24) keeps percent, numerator, denominator": (lambda v: (v["value"], v["numerator"], v["denominator"], v["raw"]))(rec(latest, "Crosses")["home"]) == (75, 18, 24, "75% (18/24)"),
+  "old-format message stored (3:2) and has no statistics": sc(legacy) == "3:2" and e["LEGACY_STATS_CODE"] == "404",
+}
+for name, ok in checks.items():
+    print(("ok   " if ok else "FAIL ") + name)
+print("RESULT:", "OK" if all(checks.values()) else "MISMATCH")
+sys.exit(0 if all(checks.values()) else 1)
 PY

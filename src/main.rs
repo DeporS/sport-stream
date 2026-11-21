@@ -11,7 +11,7 @@ use serde::Serialize;
 
 use kafka::{KafkaConfig, Publisher};
 use parser::{MatchSnapshot, ParseError, parse_match};
-use stats::StatRecord;
+use stats::{StatRecord, StatisticsReading};
 
 const USAGE: &str = "usage: sport-stream <path-to-html>
        sport-stream --url <http-url> [--poll-seconds <N> [--max-polls <N>]
@@ -19,7 +19,9 @@ const USAGE: &str = "usage: sport-stream <path-to-html>
        add --format flashscore --home-team <name> --away-team <name> to read a
        Flashscore core feed instead of HTML (default: --format html)
        sport-stream <core-feed-file> --format flashscore --home-team <name> --away-team <name>
-                    --stats-file <stats-feed-file>   (local replay: score + statistics as one JSON)";
+                    --stats-file <stats-feed-file>   (local replay: score + statistics as one JSON)
+       sport-stream --url <core-url> --poll-seconds <N> --format flashscore ...
+                    --stats-url <stats-feed-url>     (also fetch statistics in every poll)";
 
 /// How the fetched text is turned into a snapshot.
 #[derive(Debug, PartialEq, Eq)]
@@ -43,13 +45,22 @@ impl Format {
     }
 }
 
-/// Splits off `--format`, `--home-team`, `--away-team` and `--stats-file`; the rest goes to
-/// `parse_args`. The third element is the optional statistics feed file for local replay.
-fn parse_cli(
-    args: impl IntoIterator<Item = String>,
-) -> Result<(Input, Format, Option<String>), String> {
+#[derive(Debug, PartialEq, Eq)]
+struct Cli {
+    input: Input,
+    format: Format,
+    /// Local replay: statistics feed read from a file (file input only).
+    stats_file: Option<String>,
+    /// Polling: statistics feed fetched together with the score in every attempt.
+    stats_url: Option<String>,
+}
+
+/// Splits off `--format`, `--home-team`, `--away-team`, `--stats-file` and `--stats-url`;
+/// the rest goes to `parse_args`.
+fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
     let mut args = args.into_iter();
-    let (mut format, mut home, mut away, mut stats_file) = (None, None, None, None);
+    let (mut format, mut home, mut away) = (None, None, None);
+    let (mut stats_file, mut stats_url) = (None, None);
     let mut rest = Vec::new();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -57,6 +68,7 @@ fn parse_cli(
             "--home-team" => once(&mut home, &arg, text(&arg, args.next())?)?,
             "--away-team" => once(&mut away, &arg, text(&arg, args.next())?)?,
             "--stats-file" => once(&mut stats_file, &arg, text(&arg, args.next())?)?,
+            "--stats-url" => once(&mut stats_url, &arg, text(&arg, args.next())?)?,
             _ => rest.push(arg),
         }
     }
@@ -83,12 +95,28 @@ fn parse_cli(
         }
     };
     let input = parse_args(rest)?;
-    if stats_file.is_some() && !(matches!(input, Input::File(_)) && format != Format::Html) {
+    let flashscore = format != Format::Html;
+    if stats_file.is_some() && stats_url.is_some() {
+        return Err(format!(
+            "--stats-file and --stats-url cannot be combined\n{USAGE}"
+        ));
+    }
+    if stats_file.is_some() && !(matches!(input, Input::File(_)) && flashscore) {
         return Err(format!(
             "--stats-file needs a local core feed file and --format flashscore\n{USAGE}"
         ));
     }
-    Ok((input, format, stats_file))
+    if stats_url.is_some() && !(matches!(input, Input::Poll { .. }) && flashscore) {
+        return Err(format!(
+            "--stats-url needs --url with --poll-seconds and --format flashscore\n{USAGE}"
+        ));
+    }
+    Ok(Cli {
+        input,
+        format,
+        stats_file,
+        stats_url,
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -107,6 +135,11 @@ enum Input {
 struct Observation<'a> {
     observed_at: DateTime<Utc>,
     snapshot: &'a MatchSnapshot,
+    // Printed only when statistics were collected (the full list goes to Kafka).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    statistics_observed_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    statistics_count: Option<usize>,
 }
 
 fn positive(flag: &str, value: Option<String>) -> Result<u64, String> {
@@ -215,28 +248,64 @@ fn render(snapshot: &MatchSnapshot) -> Result<String, String> {
 fn render_observation(
     snapshot: &MatchSnapshot,
     observed_at: DateTime<Utc>,
+    statistics: Option<&StatisticsReading>,
 ) -> Result<String, String> {
     let observation = Observation {
         observed_at,
         snapshot,
+        statistics_observed_at: statistics.map(|s| s.observed_at),
+        statistics_count: statistics.map(|s| s.records.len()),
     };
     serde_json::to_string(&observation).map_err(|e| format!("cannot serialize: {e}"))
 }
 
+/// Turns a fetched statistics response into a reading; `observed_at` is the time the
+/// statistics response itself was received.
+fn statistics_reading(
+    fetched: Result<(String, DateTime<Utc>), String>,
+    url: &str,
+) -> Result<StatisticsReading, String> {
+    let (body, observed_at) = fetched?;
+    let records = stats::parse_stats_feed(&body).map_err(|e| format!("cannot parse {url}: {e}"))?;
+    Ok(StatisticsReading {
+        observed_at,
+        records,
+    })
+}
+
+/// One polling attempt. The score is mandatory: if it cannot be fetched or parsed nothing
+/// is published. Statistics are optional: if they fail, the score is still published
+/// without them and the error is reported on stderr.
 async fn poll_once(
     client: &reqwest::Client,
     publisher: Option<&Publisher>,
     format: &Format,
     url: &str,
+    stats_url: Option<&str>,
 ) -> Result<String, String> {
     let (body, observed_at) = source::fetch_url(client, url).await?;
     let snapshot = format
         .parse(&body)
         .map_err(|e| format!("cannot parse {url}: {e}"))?;
+    let statistics = match stats_url {
+        Some(stats_url) => {
+            let fetched = source::fetch_url(client, stats_url).await;
+            match statistics_reading(fetched, stats_url) {
+                Ok(reading) => Some(reading),
+                Err(e) => {
+                    eprintln!("error: statistics skipped, publishing the score only: {e}");
+                    None
+                }
+            }
+        }
+        None => None,
+    };
     if let Some(publisher) = publisher {
-        publisher.publish(&snapshot, observed_at).await?;
+        publisher
+            .publish(&snapshot, observed_at, statistics.as_ref())
+            .await?;
     }
-    render_observation(&snapshot, observed_at)
+    render_observation(&snapshot, observed_at, statistics.as_ref())
 }
 
 /// Polls sequentially: the next attempt starts `interval` after the previous one finished.
@@ -244,6 +313,7 @@ async fn poll_once(
 async fn poll(
     format: &Format,
     url: &str,
+    stats_url: Option<&str>,
     interval: Duration,
     max_polls: Option<u64>,
     kafka: Option<KafkaConfig>,
@@ -253,7 +323,7 @@ async fn poll(
     let (mut attempts, mut successes) = (0u64, 0u64);
     loop {
         attempts += 1;
-        match poll_once(&client, publisher.as_ref(), format, url).await {
+        match poll_once(&client, publisher.as_ref(), format, url, stats_url).await {
             Ok(line) => {
                 successes += 1;
                 println!("{line}");
@@ -273,7 +343,12 @@ async fn poll(
 }
 
 async fn run() -> Result<(), String> {
-    let (input, format, stats_file) = parse_cli(env::args().skip(1))?;
+    let Cli {
+        input,
+        format,
+        stats_file,
+        stats_url,
+    } = parse_cli(env::args().skip(1))?;
     let (body, origin) = match input {
         Input::File(path) => (source::read_file(&path)?, path),
         Input::Url(url) => {
@@ -285,7 +360,17 @@ async fn run() -> Result<(), String> {
             interval,
             max_polls,
             kafka,
-        } => return poll(&format, &url, interval, max_polls, kafka).await,
+        } => {
+            return poll(
+                &format,
+                &url,
+                stats_url.as_deref(),
+                interval,
+                max_polls,
+                kafka,
+            )
+            .await;
+        }
     };
     let snapshot = format
         .parse(&body)
@@ -334,12 +419,22 @@ mod tests {
 
     #[test]
     fn parses_format_options() {
-        let (input, format, stats) = parse_cli(args(&["a.html"])).unwrap();
+        let cli = parse_cli(args(&["a.html"])).unwrap();
         assert_eq!(
-            (input, format, stats),
-            (Input::File("a.html".into()), Format::Html, None)
+            cli,
+            Cli {
+                input: Input::File("a.html".into()),
+                format: Format::Html,
+                stats_file: None,
+                stats_url: None
+            }
         );
-        let (input, format, stats) = parse_cli(args(&[
+        let Cli {
+            input,
+            format,
+            stats_file,
+            stats_url,
+        } = parse_cli(args(&[
             "--url",
             "http://x",
             "--format",
@@ -351,7 +446,7 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(input, Input::Url("http://x".into()));
-        assert_eq!(stats, None);
+        assert_eq!((stats_file, stats_url), (None, None));
         assert_eq!(
             format,
             Format::Flashscore {
@@ -397,13 +492,122 @@ mod tests {
             let all: Vec<&str> = flash.iter().chain(extra).copied().collect();
             parse_cli(args(&all))
         };
-        let (input, _, stats) = with(&["core.txt", "--stats-file", "stats.txt"]).unwrap();
-        assert_eq!(input, Input::File("core.txt".into()));
-        assert_eq!(stats.as_deref(), Some("stats.txt"));
+        let cli = with(&["core.txt", "--stats-file", "stats.txt"]).unwrap();
+        assert_eq!(cli.input, Input::File("core.txt".into()));
+        assert_eq!(cli.stats_file.as_deref(), Some("stats.txt"));
         assert!(with(&["--url", "http://x", "--stats-file", "s"]).is_err());
         assert!(with(&["core.txt", "--stats-file"]).is_err());
         assert!(with(&["core.txt", "--stats-file", "a", "--stats-file", "b"]).is_err());
         assert!(parse_cli(args(&["core.txt", "--stats-file", "s"])).is_err());
+    }
+
+    #[test]
+    fn stats_url_needs_flashscore_polling() {
+        let flash = [
+            "--format",
+            "flashscore",
+            "--home-team",
+            "A",
+            "--away-team",
+            "B",
+        ];
+        let with = |extra: &[&str]| {
+            let all: Vec<&str> = flash.iter().chain(extra).copied().collect();
+            parse_cli(args(&all))
+        };
+        let cli = with(&[
+            "--url",
+            "http://x/core",
+            "--poll-seconds",
+            "2",
+            "--stats-url",
+            "http://x/st",
+        ])
+        .unwrap();
+        assert_eq!(cli.stats_url.as_deref(), Some("http://x/st"));
+        assert_eq!(cli.stats_file, None);
+        // Kafka and --max-polls still combine with it.
+        assert!(
+            with(&[
+                "--url",
+                "http://x/core",
+                "--poll-seconds",
+                "2",
+                "--max-polls",
+                "3",
+                "--kafka-brokers",
+                "b:1",
+                "--match-id",
+                "m",
+                "--stats-url",
+                "http://x/st",
+            ])
+            .is_ok()
+        );
+        // Not without polling, not for a file, not combined with --stats-file, not for HTML.
+        assert!(with(&["--url", "http://x/core", "--stats-url", "http://x/st"]).is_err());
+        assert!(with(&["core.txt", "--stats-url", "http://x/st"]).is_err());
+        assert!(
+            with(&[
+                "--url",
+                "u",
+                "--poll-seconds",
+                "2",
+                "--stats-url",
+                "s",
+                "--stats-file",
+                "f"
+            ])
+            .is_err()
+        );
+        assert!(with(&["--url", "u", "--poll-seconds", "2", "--stats-url"]).is_err());
+        assert!(
+            parse_cli(args(&[
+                "--url",
+                "u",
+                "--poll-seconds",
+                "2",
+                "--stats-url",
+                "s"
+            ]))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn failed_statistics_do_not_produce_a_reading() {
+        let at = Utc::now();
+        assert!(
+            statistics_reading(Err("boom".into()), "u")
+                .unwrap_err()
+                .contains("boom")
+        );
+        for body in ["", "garbage", "SE÷Match¬~"] {
+            assert!(
+                statistics_reading(Ok((body.into(), at)), "u").is_err(),
+                "{body:?}"
+            );
+        }
+        let ok =
+            statistics_reading(Ok(("SE÷Match¬~SG÷Fouls¬SH÷1¬SI÷2¬~".into(), at)), "u").unwrap();
+        assert_eq!((ok.observed_at, ok.records.len()), (at, 1));
+    }
+
+    #[test]
+    fn observation_line_mentions_statistics_only_when_present() {
+        let snap = flashscore::parse_core_feed("DE÷1¬DF÷0¬", "A", "B").unwrap();
+        let at = Utc::now();
+        let reading = StatisticsReading {
+            observed_at: at,
+            records: stats::parse_stats_feed("SE÷Match¬~SG÷Fouls¬SH÷1¬SI÷2¬~").unwrap(),
+        };
+        let with: serde_json::Value =
+            serde_json::from_str(&render_observation(&snap, at, Some(&reading)).unwrap()).unwrap();
+        assert_eq!(with["statistics_count"], 1);
+        assert!(with["statistics_observed_at"].is_string());
+        let without: serde_json::Value =
+            serde_json::from_str(&render_observation(&snap, at, None).unwrap()).unwrap();
+        assert!(without.get("statistics_count").is_none());
     }
 
     #[test]
@@ -558,7 +762,7 @@ mod tests {
             .unwrap()
             .to_utc();
         assert_eq!(
-            render_observation(&snap, at).unwrap(),
+            render_observation(&snap, at, None).unwrap(),
             r#"{"observed_at":"2026-01-02T03:04:05Z","snapshot":{"home_team":"A","away_team":"B","home_score":1,"away_score":0}}"#
         );
     }

@@ -5,6 +5,9 @@ GET /match.html returns the fixture with the score 0:0, 1:0 and 2:1 for the
 first, second and third request (and 2:1 afterwards).
 GET /feed/dc_1_demo replays the same three scores as a synthetic Flashscore
 core feed (fixtures/flashscore/core_*.txt), with its own counter.
+GET /feed/df_st_demo returns synthetic statistics (fixtures/flashscore/stats_demo_*.txt):
+home xG 0.42 on the first request, 1.20 on the second, and HTTP 500 afterwards (so the
+third poll has a score but no statistics).
 GET /healthz is a readiness probe and does not advance the match.
 """
 import sys
@@ -18,7 +21,9 @@ assert ">2:1<" in TEMPLATE, "fixture must contain the placeholder score 2:1"
 FEED_DIR = Path(__file__).resolve().parent.parent / "fixtures" / "flashscore"
 FEEDS = [(FEED_DIR / f"core_{s.replace(':', '-')}.txt").read_bytes() for s in SCORES]
 
-served = {"html": 0, "flashscore": 0}
+STATS = [(FEED_DIR / f"stats_demo_{i}.txt").read_bytes() for i in (1, 2)]
+
+served = {"html": 0, "flashscore": 0, "stats": 0}
 
 
 def next_index(kind):
@@ -37,6 +42,12 @@ class Handler(BaseHTTPRequestHandler):
             ctype = "text/html; charset=utf-8"
         elif self.path == "/feed/dc_1_demo":
             body, ctype = FEEDS[next_index("flashscore")], "text/plain; charset=utf-8"
+        elif self.path == "/feed/df_st_demo":
+            served["stats"] += 1
+            if served["stats"] > len(STATS):
+                self.send_error(500)
+                return
+            body, ctype = STATS[served["stats"] - 1], "text/plain; charset=utf-8"
         else:
             self.send_error(404)
             return

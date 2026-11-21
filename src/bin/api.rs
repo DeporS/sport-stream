@@ -62,6 +62,36 @@ impl From<Row> for ObservationJson {
     }
 }
 
+#[derive(FromRow)]
+struct StatisticsRow {
+    match_id: String,
+    observed_at: DateTime<Utc>,
+    statistics_observed_at: DateTime<Utc>,
+    statistics: serde_json::Value,
+}
+
+#[derive(Serialize)]
+struct StatisticsJson {
+    match_id: String,
+    /// When the score of the same observation was read.
+    observed_at: DateTime<Utc>,
+    /// When the statistics response was read; this is what `at` is compared with.
+    statistics_observed_at: DateTime<Utc>,
+    /// Ordered `{period, name, home, away}` records exactly as the collector sent them.
+    statistics: serde_json::Value,
+}
+
+impl From<StatisticsRow> for StatisticsJson {
+    fn from(r: StatisticsRow) -> Self {
+        Self {
+            match_id: r.match_id,
+            observed_at: r.observed_at,
+            statistics_observed_at: r.statistics_observed_at,
+            statistics: r.statistics,
+        }
+    }
+}
+
 enum ApiError {
     BadRequest(String),
     NotFound(String),
@@ -169,10 +199,41 @@ async fn state(
     })
 }
 
+async fn statistics(
+    State(pool): State<PgPool>,
+    Path(match_id): Path<String>,
+    Query(params): Query<StateParams>,
+) -> Result<Json<StatisticsJson>, ApiError> {
+    let at = parse_at(params.at.as_deref())?;
+    // Only observations that carry statistics count: a newer score-only row is skipped.
+    // No `at` means "no upper limit" (infinity), i.e. the latest available reading. The bound
+    // is written as COALESCE(..) rather than `$2 IS NULL OR ..` so that it stays an index
+    // condition on (match_id, statistics_observed_at) instead of a filter over newer rows.
+    let row: Option<StatisticsRow> = sqlx::query_as(
+        "SELECT match_id, observed_at, statistics_observed_at, statistics
+         FROM match_observations
+         WHERE match_id = $1 AND statistics IS NOT NULL
+           AND statistics_observed_at <= COALESCE($2::timestamptz, 'infinity'::timestamptz)
+         ORDER BY statistics_observed_at DESC, topic DESC, kafka_partition DESC, kafka_offset DESC
+         LIMIT 1",
+    )
+    .bind(&match_id)
+    .bind(at)
+    .fetch_optional(&pool)
+    .await
+    .map_err(ApiError::Internal)?;
+    row.map(|o| Json(o.into())).ok_or_else(|| {
+        ApiError::NotFound(format!(
+            "no statistics of match {match_id} at the given time"
+        ))
+    })
+}
+
 fn app(pool: PgPool) -> Router {
     Router::new()
         .route("/matches/{match_id}/observations", get(history))
         .route("/matches/{match_id}/state", get(state))
+        .route("/matches/{match_id}/statistics", get(statistics))
         .with_state(pool)
 }
 

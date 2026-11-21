@@ -196,7 +196,7 @@ one. Timestamps are stored with microsecond precision.
 ## One-command demo
 
 ```sh
-./scripts/demo.sh            # HTML replay; `./scripts/demo.sh flashscore` for the feed replay
+./scripts/demo.sh            # HTML replay; `flashscore` for the feed replay, `stats` adds statistics
 ```
 
 The script starts Kafka and PostgreSQL in its own Compose project
@@ -294,6 +294,60 @@ A real `0` is `integer` with value 0, never `missing`. An empty payload, a paylo
 without any `SG` row, a row with values but no name, or conflicting duplicate
 fields in one row is an error. Unlike the reference parser, no period is dropped
 and no missing value becomes 0.
+
+#### Statistics through the pipeline
+
+With `--format flashscore` and polling, `--stats-url <url>` fetches the statistics feed in the
+same attempt as the score and publishes both in one Kafka message:
+
+```sh
+cargo run -- --url http://127.0.0.1:8000/feed/dc_1_demo --poll-seconds 2 --format flashscore \
+  --home-team "Lech Poznań" --away-team "Legia Warszawa" \
+  --stats-url http://127.0.0.1:8000/feed/df_st_demo \
+  --kafka-brokers 127.0.0.1:9092 --match-id demo-lech-legia
+```
+
+- The score keeps its `observed_at`; the message carries an optional
+  `"statistics": {"observed_at": ..., "records": [...]}` with its own `observed_at` (when the
+  *statistics response* was received). A score-only message is byte-for-byte the old format
+  (`schema_version` stays 1, the field is additive); the consumer reads both. Compatibility
+  was checked with the consumer binary built from the previous commit (`458f2d9`): it read
+  new-format messages, ignored `statistics` and stored the score. Such an old consumer cannot
+  be started after migration `0002` is applied (sqlx rejects the unknown migration), so
+  upgrade the consumer before, or together with, the database.
+- The score is mandatory: if it cannot be fetched or parsed, nothing is published for that
+  attempt. If the score is fine but the statistics request or parsing fails, the score is
+  published without statistics and `error: statistics skipped, ...` goes to stderr.
+- The consumer stores the score and the statistics in the same row in one statement (offset
+  committed afterwards). Migration `0002` adds nullable `statistics_observed_at` and
+  `statistics JSONB` (an ordered list: periods, repeated names, raw values and
+  `null` / `0` / `n/a` are kept as sent).
+
+`GET /matches/{match_id}/statistics[?at=<RFC3339>]` returns the newest observation that has
+statistics and whose `statistics_observed_at` is `<= at` (no `at`: the latest available).
+Newer score-only rows are skipped. `404` if there is none, `400` for an invalid `at`;
+`/observations` and `/state` are unchanged.
+
+```sh
+curl http://127.0.0.1:8080/matches/demo-lech-legia/statistics
+curl "http://127.0.0.1:8080/matches/demo-lech-legia/statistics?at=2026-11-21T16:51:03Z"
+```
+
+```json
+{"match_id": "demo-lech-legia",
+ "observed_at": "2026-11-21T16:51:04.420059Z",
+ "statistics_observed_at": "2026-11-21T16:51:04.420726Z",
+ "statistics": [{"period": "Match", "name": "Expected goals (xG)",
+                 "home": {"raw": "1.20", "kind": "decimal", "value": 1.2, "numerator": null, "denominator": null},
+                 "away": {"raw": "0.35", "kind": "decimal", "value": 0.35, "numerator": null, "denominator": null}},
+                ...]}
+```
+
+`./scripts/demo.sh stats` runs it all locally (Docker, synthetic fixtures, nothing is sent to
+Flashscore): xG `0.42`, then `1.20`, then a poll with a failing statistics request, plus a
+hand-written old-format message. It checks the latest reading (`1.20`), a time between the
+readings (`0.42`), a time before the first reading (`404`), that the newer score-only
+observation keeps the last statistics available, and that the old message is stored.
 
 ## Test
 
