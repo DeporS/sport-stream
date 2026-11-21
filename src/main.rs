@@ -1,3 +1,4 @@
+mod flashscore;
 mod kafka;
 mod parser;
 mod source;
@@ -8,11 +9,73 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use kafka::{KafkaConfig, Publisher};
-use parser::{MatchSnapshot, parse_match};
+use parser::{MatchSnapshot, ParseError, parse_match};
 
 const USAGE: &str = "usage: sport-stream <path-to-html>
        sport-stream --url <http-url> [--poll-seconds <N> [--max-polls <N>]
-                    [--kafka-brokers <host:port> --match-id <id>]]";
+                    [--kafka-brokers <host:port> --match-id <id>]]
+       add --format flashscore --home-team <name> --away-team <name> to read a
+       Flashscore core feed instead of HTML (default: --format html)";
+
+/// How the fetched text is turned into a snapshot.
+#[derive(Debug, PartialEq, Eq)]
+enum Format {
+    Html,
+    Flashscore {
+        home_team: String,
+        away_team: String,
+    },
+}
+
+impl Format {
+    fn parse(&self, body: &str) -> Result<MatchSnapshot, ParseError> {
+        match self {
+            Self::Html => parse_match(body),
+            Self::Flashscore {
+                home_team,
+                away_team,
+            } => flashscore::parse_core_feed(body, home_team, away_team),
+        }
+    }
+}
+
+/// Splits off `--format`, `--home-team` and `--away-team`; the rest goes to `parse_args`.
+fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<(Input, Format), String> {
+    let mut args = args.into_iter();
+    let (mut format, mut home, mut away) = (None, None, None);
+    let mut rest = Vec::new();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--format" => once(&mut format, &arg, text(&arg, args.next())?)?,
+            "--home-team" => once(&mut home, &arg, text(&arg, args.next())?)?,
+            "--away-team" => once(&mut away, &arg, text(&arg, args.next())?)?,
+            _ => rest.push(arg),
+        }
+    }
+    let format = match (format.as_deref(), home, away) {
+        (None | Some("html"), None, None) => Format::Html,
+        (None | Some("html"), _, _) => {
+            return Err(format!(
+                "--home-team and --away-team require --format flashscore\n{USAGE}"
+            ));
+        }
+        (Some("flashscore"), Some(home_team), Some(away_team)) => Format::Flashscore {
+            home_team: home_team.trim().to_string(),
+            away_team: away_team.trim().to_string(),
+        },
+        (Some("flashscore"), _, _) => {
+            return Err(format!(
+                "--format flashscore requires --home-team and --away-team\n{USAGE}"
+            ));
+        }
+        (Some(other), _, _) => {
+            return Err(format!(
+                "unknown format {other:?} (expected html or flashscore)\n{USAGE}"
+            ));
+        }
+    };
+    Ok((parse_args(rest)?, format))
+}
 
 #[derive(Debug, PartialEq, Eq)]
 enum Input {
@@ -133,10 +196,13 @@ fn render_observation(
 async fn poll_once(
     client: &reqwest::Client,
     publisher: Option<&Publisher>,
+    format: &Format,
     url: &str,
 ) -> Result<String, String> {
-    let (html, observed_at) = source::fetch_url(client, url).await?;
-    let snapshot = parse_match(&html).map_err(|e| format!("cannot parse {url}: {e}"))?;
+    let (body, observed_at) = source::fetch_url(client, url).await?;
+    let snapshot = format
+        .parse(&body)
+        .map_err(|e| format!("cannot parse {url}: {e}"))?;
     if let Some(publisher) = publisher {
         publisher.publish(&snapshot, observed_at).await?;
     }
@@ -146,6 +212,7 @@ async fn poll_once(
 /// Polls sequentially: the next attempt starts `interval` after the previous one finished.
 /// With Kafka enabled, a line is printed only after the broker acknowledged the message.
 async fn poll(
+    format: &Format,
     url: &str,
     interval: Duration,
     max_polls: Option<u64>,
@@ -156,7 +223,7 @@ async fn poll(
     let (mut attempts, mut successes) = (0u64, 0u64);
     loop {
         attempts += 1;
-        match poll_once(&client, publisher.as_ref(), url).await {
+        match poll_once(&client, publisher.as_ref(), format, url).await {
             Ok(line) => {
                 successes += 1;
                 println!("{line}");
@@ -176,7 +243,8 @@ async fn poll(
 }
 
 async fn run() -> Result<(), String> {
-    let (html, origin) = match parse_args(env::args().skip(1))? {
+    let (input, format) = parse_cli(env::args().skip(1))?;
+    let (body, origin) = match input {
         Input::File(path) => (source::read_file(&path)?, path),
         Input::Url(url) => {
             let client = source::build_client()?;
@@ -187,9 +255,11 @@ async fn run() -> Result<(), String> {
             interval,
             max_polls,
             kafka,
-        } => return poll(&url, interval, max_polls, kafka).await,
+        } => return poll(&format, &url, interval, max_polls, kafka).await,
     };
-    let snapshot = parse_match(&html).map_err(|e| format!("cannot parse {origin}: {e}"))?;
+    let snapshot = format
+        .parse(&body)
+        .map_err(|e| format!("cannot parse {origin}: {e}"))?;
     println!("{}", render(&snapshot)?);
     Ok(())
 }
@@ -223,6 +293,66 @@ mod tests {
             parse_args(args(&["--url", "http://x"])),
             Ok(Input::Url("http://x".into()))
         );
+    }
+
+    #[test]
+    fn parses_format_options() {
+        let (input, format) = parse_cli(args(&["a.html"])).unwrap();
+        assert_eq!(
+            (input, format),
+            (Input::File("a.html".into()), Format::Html)
+        );
+        let (input, format) = parse_cli(args(&[
+            "--url",
+            "http://x",
+            "--format",
+            "flashscore",
+            "--home-team",
+            " A ",
+            "--away-team",
+            "B",
+        ]))
+        .unwrap();
+        assert_eq!(input, Input::Url("http://x".into()));
+        assert_eq!(
+            format,
+            Format::Flashscore {
+                home_team: "A".into(),
+                away_team: "B".into()
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_bad_format_options() {
+        for bad in [
+            &["a", "--format", "flashscore"][..],
+            &["a", "--format", "flashscore", "--home-team", "A"],
+            &["a", "--home-team", "A", "--away-team", "B"],
+            &["a", "--format", "xml"],
+            &[
+                "a",
+                "--format",
+                "html",
+                "--home-team",
+                "A",
+                "--away-team",
+                "B",
+            ],
+            &["a", "--format"],
+        ] {
+            assert!(parse_cli(args(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn format_dispatches_to_the_right_parser() {
+        let flash = Format::Flashscore {
+            home_team: "A".into(),
+            away_team: "B".into(),
+        };
+        assert_eq!(flash.parse("DE÷3¬DF÷2¬").unwrap().home_score, 3);
+        assert!(Format::Html.parse("DE÷3¬DF÷2¬").is_err());
     }
 
     #[test]

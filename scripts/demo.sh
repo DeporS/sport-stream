@@ -1,9 +1,22 @@
 #!/usr/bin/env bash
 # Repeatable sport-stream demo: HTML -> collector -> Kafka -> consumer -> PostgreSQL -> API.
 # Uses its own Docker Compose project (sport-stream-demo); it never touches other containers.
+#
+# Usage: scripts/demo.sh [html|flashscore]   (default: html)
+#   html        replays a synthetic HTML page
+#   flashscore  replays a synthetic Flashscore core feed (offline, nothing is sent to Flashscore)
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+
+MODE=${1:-html}
+case "$MODE" in
+  html) SOURCE_PATH=match.html; COLLECTOR_FORMAT=() ;;
+  flashscore)
+    SOURCE_PATH=feed/dc_1_demo
+    COLLECTOR_FORMAT=(--format flashscore --home-team "Lech Poznań" --away-team "Legia Warszawa") ;;
+  *) printf 'usage: %s [html|flashscore]\n' "$0" >&2; exit 2 ;;
+esac
 
 PROJECT=sport-stream-demo
 HTML_PORT=8000
@@ -94,8 +107,8 @@ PIDS+=($!)
 wait_for "HTML server" 10 curl -sf "http://127.0.0.1:$HTML_PORT/healthz"
 
 # --- pipeline ---------------------------------------------------------------
-log "collecting three observations"
-"$BIN/sport-stream" --url "http://127.0.0.1:$HTML_PORT/match.html" \
+log "collecting three observations (mode: $MODE)"
+"$BIN/sport-stream" --url "http://127.0.0.1:$HTML_PORT/$SOURCE_PATH" "${COLLECTOR_FORMAT[@]}" \
   --poll-seconds 2 --max-polls 3 \
   --kafka-brokers "127.0.0.1:$KAFKA_PORT" --match-id "$MATCH_ID" >"$WORK/collector.log" 2>&1 \
   || die "collector failed"

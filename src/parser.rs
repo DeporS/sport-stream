@@ -15,6 +15,9 @@ pub struct MatchSnapshot {
 pub enum ParseError {
     MissingField(&'static str),
     InvalidScore(String),
+    EmptyPayload,
+    InvalidField { field: &'static str, value: String },
+    AmbiguousField { field: &'static str },
 }
 
 impl fmt::Display for ParseError {
@@ -22,6 +25,19 @@ impl fmt::Display for ParseError {
         match self {
             Self::MissingField(name) => write!(f, "missing or empty field: {name}"),
             Self::InvalidScore(raw) => write!(f, "invalid score {raw:?}, expected format \"H:A\""),
+            Self::EmptyPayload => write!(f, "empty payload"),
+            Self::InvalidField { field, value } => {
+                write!(
+                    f,
+                    "invalid {field}: {value:?} is not a non-negative integer"
+                )
+            }
+            Self::AmbiguousField { field } => {
+                write!(
+                    f,
+                    "ambiguous {field}: the payload contains conflicting values"
+                )
+            }
         }
     }
 }

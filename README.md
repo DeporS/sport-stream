@@ -196,7 +196,7 @@ one. Timestamps are stored with microsecond precision.
 ## One-command demo
 
 ```sh
-./scripts/demo.sh
+./scripts/demo.sh            # HTML replay; `./scripts/demo.sh flashscore` for the feed replay
 ```
 
 The script starts Kafka and PostgreSQL in its own Compose project
@@ -223,6 +223,37 @@ Requirements (WSL Ubuntu): Docker with the Compose plugin (and a running
 daemon, e.g. Docker Desktop with WSL integration), a Rust toolchain (`cargo`),
 `python3` and `curl`. The first run downloads the Kafka and PostgreSQL images
 and compiles the project.
+
+### Flashscore core feed (offline replay)
+
+`--format flashscore` reads a Flashscore *core feed* payload (the `dc_1_<match id>`
+endpoint of the reference project
+[value-bet-live-detection](https://github.com/DeporS/value-bet-live-detection))
+instead of HTML. The payload is a list of `key÷value` pairs separated by `¬`.
+The score comes from `DE` (home goals) and `DF` (away goals). This code
+does not read team names from the payload (the reference parser does not either), so they are passed as match metadata with
+`--home-team` and `--away-team` (required with this format, rejected without it).
+Status fields (`DA`, `DB`, `DD`) and the statistics/odds feeds are not read yet.
+
+A missing, empty, non-numeric or conflicting (`DE` given twice with different
+values) score and an empty payload are errors; a real `0:0` is valid. The
+`MatchSnapshot` JSON, the Kafka message and `observed_at` (time the collector
+received the response) are unchanged. This stage never contacts Flashscore;
+it replays synthetic payloads from `fixtures/flashscore/`:
+
+```sh
+cargo run -- fixtures/flashscore/core_2-1.txt --format flashscore \
+  --home-team "Lech Poznań" --away-team "Legia Warszawa"
+
+# replay over HTTP with polling (the demo server serves 0:0, 1:0, 2:1)
+python3 scripts/demo_server.py 8000 &
+cargo run -- --url http://127.0.0.1:8000/feed/dc_1_demo --poll-seconds 1 --max-polls 3 \
+  --format flashscore --home-team "Lech Poznań" --away-team "Legia Warszawa"
+kill %1
+
+# whole pipeline (Kafka -> consumer -> PostgreSQL -> API) with the Flashscore replay
+./scripts/demo.sh flashscore
+```
 
 ## Test
 
