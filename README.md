@@ -416,6 +416,54 @@ stays until Ctrl+C, which stops only the processes and the Docker project starte
 `LIVE_UPDATES=4 ./scripts/demo.sh live` runs it non-interactively and checks the API fields and the
 viewer output.
 
+#### Real statistics in the terminal (one GET, no pipeline)
+
+`sport-stream stats` fetches the Flashscore team statistics (GraphQL JSON,
+`data.findEventById.teamStats.entries`) **once** and prints them. It needs no match score, Docker,
+Kafka, database or local server, and uses the same parser as the replays. Quote the URL (it
+contains `&`):
+
+```sh
+cargo run --quiet -- stats --stats-url 'https://2.ds.lsapp.eu/pq_graphql?_hash=dts&eventId=<event id>&providerId=101'
+cargo run --quiet -- stats --stats-url '<url>' --json     # JSON including rawValue
+```
+
+- Output: the fetch time and HTTP status, then one table per `eventStageId` with **all** metrics.
+  Nothing is hard-coded: the numbers of entries, teams, stages and metrics come from the response.
+- Columns are headed by **team ids**, sorted by id: the response does not say who is the home team,
+  so no role is assumed from the order of the entries. Stages are labelled by their id in order of
+  appearance (`name not confirmed`), no period name is guessed.
+- A cell shows `value` and, if present, `subValue` (`443 (92%)`); `-` means no value or no entry for
+  that team. `rawValue` appears only with `--json`, together with `value` and `subValue` per team.
+- One request with a 10 s timeout. A failed HTTP request (status, connection, timeout), GraphQL
+  `errors`, a body that is not JSON and a payload without `teamStats.entries` each exit with code 1
+  and a one-line `error: ...`.
+- A local file literally named `stats` must now be passed as `./stats` (`stats` is the command).
+
+#### Refreshing the table: `--watch`
+
+```sh
+cargo run --quiet -- stats --stats-url \
+  'https://2.ds.lsapp.eu/pq_graphql?_hash=dts&eventId=Ch0xovNM&providerId=101' \
+  --watch --interval 30
+```
+
+- Reads at once, then again `--interval` seconds after each attempt finished (positive number of
+  seconds, default 30; one HTTP client, strictly sequential requests) until Ctrl+C, which stops
+  cleanly with exit code 0. On a terminal the table is redrawn in place; when stdout is not a
+  terminal the screens are printed one after another, separated by a line.
+- The screen shows the attempt number, the time of the **last successful read** (`Fetched at ...`),
+  all metrics of all stages and the team ids as column headers, as in the single read.
+- A transient failure (HTTP error, timeout, GraphQL `errors`, bad payload) keeps the last good table
+  and adds `! LAST ATTEMPT FAILED at <time>: <reason>` with the time of the data being shown; the
+  next attempt happens as usual. `401`, `403` and `429` stop the watch (printed as the last screen,
+  then `error: watch stopped: ...` on stderr, exit code 1): retrying would only make it worse.
+- `--watch --json` is rejected (use a single read for JSON); `--interval` needs `--watch`.
+- `--max-polls <N>` is a limit on **attempts**, failed ones included (it does not wait for N
+  successful reads): after the Nth attempt the watch ends with exit code 0 if at least one attempt
+  succeeded, otherwise with an error (`no successful read in N attempt(s): ...`). For scripts and
+  tests.
+
 ## Test
 
 ```sh

@@ -86,6 +86,54 @@ pub fn render_table(stats: &TeamStats, fetched_at: DateTime<Utc>, status: u16) -
     out.join("\n")
 }
 
+/// Everything `--watch` shows besides the table itself.
+pub struct WatchView<'a> {
+    pub attempt: u64,
+    pub interval: std::time::Duration,
+    /// The last successful read: stats, time the response was received, HTTP status.
+    pub last_ok: Option<(&'a TeamStats, DateTime<Utc>, u16)>,
+    /// The last attempt, if it failed: when and why.
+    pub failure: Option<(DateTime<Utc>, &'a str)>,
+    /// Set when the refresh loop gave up (e.g. HTTP 429); no further attempts are made.
+    pub stopped: Option<&'a str>,
+}
+
+fn millis(t: DateTime<Utc>) -> String {
+    t.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+/// One screen of `--watch`: a status banner, then the table of the last successful read.
+/// A failed attempt never removes the last good data; it only adds a notice.
+pub fn render_watch(view: &WatchView) -> String {
+    let mut out = Vec::new();
+    out.push(match view.stopped {
+        Some(_) => format!("Watch stopped after attempt #{}", view.attempt),
+        None => format!(
+            "Watching, refresh every {} s (Ctrl+C to exit) - attempt #{}",
+            view.interval.as_secs_f64(),
+            view.attempt
+        ),
+    });
+    if let Some((at, error)) = view.failure {
+        out.push(format!("! LAST ATTEMPT FAILED at {}: {error}", millis(at)));
+        out.push(match view.last_ok {
+            Some((_, ok_at, _)) => format!(
+                "  Showing the data from the last successful read at {}.",
+                millis(ok_at)
+            ),
+            None => "  No successful read yet, nothing to show.".to_string(),
+        });
+    }
+    if let Some(reason) = view.stopped {
+        out.push(format!("! STOPPED: {reason}"));
+    }
+    out.push(String::new());
+    if let Some((stats, ok_at, status)) = view.last_ok {
+        out.push(render_table(stats, ok_at, status));
+    }
+    out.join("\n")
+}
+
 fn cell_json(cell: Option<&Cell>) -> Value {
     match cell {
         None => Value::Null,
@@ -191,6 +239,71 @@ mod tests {
             !t.contains("Home") || t.contains("synthHome"),
             "no role names"
         );
+    }
+
+    fn watch(
+        last_ok: Option<(&TeamStats, DateTime<Utc>, u16)>,
+        failure: Option<(DateTime<Utc>, &str)>,
+        stopped: Option<&str>,
+    ) -> String {
+        render_watch(&WatchView {
+            attempt: 3,
+            interval: std::time::Duration::from_secs(30),
+            last_ok,
+            failure,
+            stopped,
+        })
+    }
+
+    #[test]
+    fn watch_screen_after_a_good_read_has_no_failure_notice() {
+        let stats = sample();
+        let t = watch(Some((&stats, at(), 200)), None, None);
+        assert!(
+            t.starts_with("Watching, refresh every 30 s (Ctrl+C to exit) - attempt #3"),
+            "{t}"
+        );
+        assert!(t.contains("Fetched at 2026-01-02T03:04:05.678Z (HTTP 200)"));
+        assert!(!t.contains("FAILED") && !t.contains("STOPPED"));
+        assert!(t.contains("expected_goals"));
+    }
+
+    #[test]
+    fn watch_screen_keeps_the_last_good_data_when_the_last_attempt_failed() {
+        let stats = sample();
+        let later = at() + chrono::Duration::seconds(30);
+        let t = watch(
+            Some((&stats, at(), 200)),
+            Some((later, "request to u returned HTTP status 500")),
+            None,
+        );
+        assert!(t.contains("! LAST ATTEMPT FAILED at 2026-01-02T03:04:35.678Z: request to u returned HTTP status 500"), "{t}");
+        assert!(t.contains(
+            "Showing the data from the last successful read at 2026-01-02T03:04:05.678Z."
+        ));
+        assert!(t.contains("Fetched at 2026-01-02T03:04:05.678Z (HTTP 200)"));
+        assert!(
+            t.contains("expected_goals"),
+            "last good table is still there"
+        );
+    }
+
+    #[test]
+    fn watch_screen_without_any_good_read_and_when_stopped() {
+        let t = watch(None, Some((at(), "connection refused")), None);
+        assert!(
+            t.contains("No successful read yet") && !t.contains("expected_goals"),
+            "{t}"
+        );
+        let stats = sample();
+        let t = watch(
+            Some((&stats, at(), 200)),
+            Some((at(), "HTTP status 429")),
+            Some("HTTP 429 Too Many Requests, not retrying"),
+        );
+        assert!(t.starts_with("Watch stopped after attempt #3"), "{t}");
+        assert!(t.contains("! STOPPED: HTTP 429 Too Many Requests, not retrying"));
+        assert!(t.contains("expected_goals"));
     }
 
     #[test]

@@ -16,8 +16,11 @@ use parser::{MatchSnapshot, ParseError, parse_match};
 use stats::{StatRecord, StatisticsReading};
 
 const STATS_USAGE: &str = "usage: sport-stream stats --stats-url <url> [--json]
+       sport-stream stats --stats-url <url> --watch [--interval <seconds>]
        Fetches the Flashscore team statistics (GraphQL JSON) once and prints them; it needs no
        match score, Docker, Kafka or local server. --json prints JSON including rawValue.
+       --watch refreshes the table in place every --interval seconds (default 30) until Ctrl+C;
+       it cannot be combined with --json. (--max-polls <N> stops after N attempts, failed ones included, for scripts.)
        (A local file literally named `stats` must be given as ./stats.)";
 
 const USAGE: &str = "usage: sport-stream <path-to-html>
@@ -424,39 +427,172 @@ async fn poll(
 struct StatsCommand {
     url: String,
     json: bool,
+    watch: bool,
+    /// Pause between attempts in `--watch` mode (always `Some` when `watch`).
+    interval: Option<Duration>,
+    /// Stop `--watch` after this many attempts (for tests and scripts); `None`: until Ctrl+C.
+    max_polls: Option<u64>,
+}
+
+const DEFAULT_WATCH_INTERVAL: Duration = Duration::from_secs(30);
+const MAX_WATCH_INTERVAL_SECS: f64 = 86_400.0;
+
+fn watch_interval(flag: &str, value: Option<String>) -> Result<Duration, String> {
+    let value = value.ok_or(format!("{flag} requires a value\n{STATS_USAGE}"))?;
+    match value.trim().parse::<f64>() {
+        Ok(secs) if secs.is_finite() && secs > 0.0 && secs <= MAX_WATCH_INTERVAL_SECS => {
+            Ok(Duration::from_secs_f64(secs))
+        }
+        _ => Err(format!(
+            "{flag} must be a positive number of seconds (at most {MAX_WATCH_INTERVAL_SECS}), got {value:?}"
+        )),
+    }
 }
 
 fn parse_stats_command(args: impl IntoIterator<Item = String>) -> Result<StatsCommand, String> {
     let mut args = args.into_iter();
-    let (mut url, mut json) = (None, false);
+    let (mut url, mut json, mut watch) = (None, false, false);
+    let (mut interval, mut max_polls) = (None, None);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--stats-url" => once(&mut url, &arg, text(&arg, args.next())?)?,
+            "--interval" => once(&mut interval, &arg, watch_interval(&arg, args.next())?)?,
+            "--max-polls" => once(&mut max_polls, &arg, positive(&arg, args.next())?)?,
             "--json" if !json => json = true,
-            "--json" => return Err(format!("--json given more than once\n{STATS_USAGE}")),
+            "--watch" if !watch => watch = true,
+            "--json" | "--watch" => {
+                return Err(format!("{arg} given more than once\n{STATS_USAGE}"));
+            }
             other => return Err(format!("unexpected argument {other}\n{STATS_USAGE}")),
         }
+    }
+    if watch && json {
+        return Err(format!(
+            "--watch cannot be combined with --json (the table is redrawn in place; use a single read for JSON)\n{STATS_USAGE}"
+        ));
+    }
+    if !watch && (interval.is_some() || max_polls.is_some()) {
+        return Err(format!(
+            "--interval and --max-polls need --watch\n{STATS_USAGE}"
+        ));
     }
     Ok(StatsCommand {
         url: url.ok_or(format!("--stats-url is required\n{STATS_USAGE}"))?,
         json,
+        watch,
+        interval: watch.then(|| interval.unwrap_or(DEFAULT_WATCH_INTERVAL)),
+        max_polls,
     })
 }
 
 /// One GET, then the shared GraphQL parser. Returns the stats, the time the response was received
-/// and the HTTP status. Failed HTTP, GraphQL `errors` and an invalid payload are separate errors.
+/// and the HTTP status. Failed HTTP, GraphQL `errors` and an invalid payload are separate errors;
+/// only an HTTP failure carries a status.
 async fn fetch_team_stats(
     client: &reqwest::Client,
     url: &str,
-) -> Result<(stats_graphql::TeamStats, DateTime<Utc>, u16), String> {
+) -> Result<(stats_graphql::TeamStats, DateTime<Utc>, u16), source::FetchError> {
     let (body, fetched_at, status) = source::fetch_url_with_status(client, url).await?;
-    let stats = stats_graphql::parse_stats_json_by_team(&body)
-        .map_err(|e| format!("cannot use the response from {url}: {e}"))?;
+    let stats = stats_graphql::parse_stats_json_by_team(&body).map_err(|e| {
+        source::FetchError::other(format!("cannot use the response from {url}: {e}"))
+    })?;
     Ok((stats, fetched_at, status))
+}
+
+/// Statuses that mean "go away": retrying every few seconds would only make things worse.
+fn is_fatal_status(status: Option<u16>) -> bool {
+    matches!(status, Some(401 | 403 | 429))
+}
+
+const SCREEN_SEPARATOR: &str =
+    "========================================================================";
+
+/// `--watch`: reads at once, then again `interval` after each attempt finished (one client,
+/// strictly sequential) until `stop` completes (Ctrl+C), `max_polls` attempts were made or a
+/// 401/403/429 arrives. A failed attempt keeps the last good table on screen with a notice.
+/// With `clear` the screen is redrawn in place, otherwise screens are separated by a line.
+async fn watch_stats(
+    client: &reqwest::Client,
+    command: &StatsCommand,
+    out: &mut impl std::io::Write,
+    clear: bool,
+    stop: impl std::future::Future<Output = ()>,
+) -> Result<(), String> {
+    let interval = command.interval.unwrap_or(DEFAULT_WATCH_INTERVAL);
+    tokio::pin!(stop);
+    let mut last_ok: Option<(stats_graphql::TeamStats, DateTime<Utc>, u16)> = None;
+    let mut last_error = String::new();
+    let mut attempt = 0u64;
+    loop {
+        attempt += 1;
+        let result = tokio::select! {
+            () = &mut stop => break,
+            result = fetch_team_stats(client, &command.url) => result,
+        };
+        let failure_at = Utc::now();
+        let mut failure = None;
+        let mut stopped = None;
+        match result {
+            Ok(read) => {
+                last_ok = Some(read);
+                last_error.clear();
+            }
+            Err(e) => {
+                last_error = e.message.clone();
+                failure = Some((failure_at, e.message.clone()));
+                if is_fatal_status(e.status) {
+                    stopped = Some(format!(
+                        "HTTP status {} - not retrying",
+                        e.status.unwrap_or_default()
+                    ));
+                }
+            }
+        }
+        let screen = stats_view::render_watch(&stats_view::WatchView {
+            attempt,
+            interval,
+            last_ok: last_ok.as_ref().map(|(s, t, c)| (s, *t, *c)),
+            failure: failure.as_ref().map(|(t, m)| (*t, m.as_str())),
+            stopped: stopped.as_deref(),
+        });
+        let io = |e: std::io::Error| format!("cannot write to the terminal: {e}");
+        if clear {
+            write!(out, "\x1b[H\x1b[2J").map_err(io)?;
+        } else {
+            writeln!(out, "{SCREEN_SEPARATOR}").map_err(io)?;
+        }
+        writeln!(out, "{screen}").map_err(io)?;
+        out.flush().map_err(io)?;
+        if let Some(reason) = stopped {
+            return Err(format!("watch stopped: {reason} ({})", last_error));
+        }
+        if command.max_polls.is_some_and(|max| attempt >= max) {
+            return match last_ok {
+                Some(_) => Ok(()),
+                None => Err(format!(
+                    "no successful read in {attempt} attempt(s): {last_error}"
+                )),
+            };
+        }
+        tokio::select! {
+            () = &mut stop => break,
+            () = tokio::time::sleep(interval) => {}
+        }
+    }
+    let _ = writeln!(out, "Stopped.");
+    Ok(())
 }
 
 async fn run_stats(command: StatsCommand) -> Result<(), String> {
     let client = source::build_client()?;
+    if command.watch {
+        use std::io::IsTerminal;
+        let clear = std::io::stdout().is_terminal();
+        let stop = async {
+            let _ = tokio::signal::ctrl_c().await;
+        };
+        return watch_stats(&client, &command, &mut std::io::stdout(), clear, stop).await;
+    }
     let (stats, fetched_at, status) = fetch_team_stats(&client, &command.url).await?;
     if command.json {
         println!("{}", stats_view::render_json(&stats, fetched_at, status)?);
@@ -736,7 +872,10 @@ mod tests {
             ok,
             StatsCommand {
                 url: "http://x/gql".into(),
-                json: false
+                json: false,
+                watch: false,
+                interval: None,
+                max_polls: None
             }
         );
         let ok = parse_stats_command(args(&["--json", "--stats-url", "http://x/gql"])).unwrap();
@@ -781,6 +920,297 @@ mod tests {
         url
     }
 
+    /// Serves the given `(status line, body)` responses to consecutive connections (the last one
+    /// repeats). Returns the URL and the number of requests received.
+    async fn serve_sequence(
+        responses: Vec<(&'static str, String)>,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::{Arc, atomic::AtomicUsize, atomic::Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/pq_graphql?_hash=dts",
+            listener.local_addr().unwrap()
+        );
+        let count = Arc::new(AtomicUsize::new(0));
+        let seen = count.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 2048];
+                let _ = socket.read(&mut buf).await;
+                let n = seen.fetch_add(1, Ordering::SeqCst);
+                let (status, body) = &responses[n.min(responses.len() - 1)];
+                let reply = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(reply.as_bytes()).await;
+            }
+        });
+        (url, count)
+    }
+
+    /// A minimal GraphQL response: expected_goals for two teams in one stage.
+    fn gql(xg_a: &str, xg_b: &str) -> String {
+        let entry = |team: &str, xg: &str| {
+            format!(
+                r#"{{"typeId":"expected_goals","value":"{xg}","subValue":null,"rawValue":"{xg}00","eventStageId":74,"teamId":"{team}"}}"#
+            )
+        };
+        format!(
+            r#"{{"data":{{"findEventById":{{"teamStats":{{"entries":[{},{}]}}}}}}}}"#,
+            entry("teamA", xg_a),
+            entry("teamB", xg_b)
+        )
+    }
+
+    fn watch_command(url: String, max_polls: Option<u64>) -> StatsCommand {
+        StatsCommand {
+            url,
+            json: false,
+            watch: true,
+            interval: Some(Duration::from_millis(30)),
+            max_polls,
+        }
+    }
+
+    /// Runs `watch_stats` without a terminal; returns the result and the screens it drew.
+    async fn run_watch(
+        command: &StatsCommand,
+        stop: impl std::future::Future<Output = ()>,
+    ) -> (Result<(), String>, Vec<String>) {
+        let client = source::build_client().unwrap();
+        let mut out = Vec::new();
+        let result = watch_stats(&client, command, &mut out, false, stop).await;
+        let text = String::from_utf8(out).unwrap();
+        let screens = text
+            .split(SCREEN_SEPARATOR)
+            .skip(1)
+            .map(str::to_string)
+            .collect();
+        (result, screens)
+    }
+
+    fn fetched_at(screen: &str) -> &str {
+        let line = screen
+            .lines()
+            .find(|l| l.starts_with("Fetched at "))
+            .unwrap();
+        line.trim_start_matches("Fetched at ")
+            .split(' ')
+            .next()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn watch_success_then_error_then_success_with_changed_xg() {
+        let (url, count) = serve_sequence(vec![
+            ("200 OK", gql("0.30", "0.10")),
+            ("500 Internal Server Error", "{}".into()),
+            ("200 OK", gql("1.20", "0.35")),
+        ])
+        .await;
+        let (result, screens) =
+            run_watch(&watch_command(url, Some(3)), std::future::pending()).await;
+        assert_eq!(result, Ok(()));
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(screens.len(), 3);
+        // 1: good read
+        assert!(
+            screens[0].contains("attempt #1") && screens[0].contains("0.30"),
+            "{}",
+            screens[0]
+        );
+        assert!(!screens[0].contains("FAILED"));
+        // 2: the attempt failed, the last good table stays and says when it was read
+        assert!(
+            screens[1].contains("! LAST ATTEMPT FAILED"),
+            "{}",
+            screens[1]
+        );
+        assert!(screens[1].contains("returned HTTP status 500"));
+        assert!(screens[1].contains("0.30") && !screens[1].contains("1.20"));
+        let first_read = fetched_at(&screens[0]).to_string();
+        assert_eq!(fetched_at(&screens[1]), first_read);
+        assert!(screens[1].contains(&format!("last successful read at {first_read}")));
+        // 3: recovered, new xG, a later read time, no failure notice
+        assert!(
+            screens[2].contains("1.20") && !screens[2].contains("0.30"),
+            "{}",
+            screens[2]
+        );
+        assert!(!screens[2].contains("FAILED"));
+        assert!(fetched_at(&screens[2]) > first_read.as_str());
+    }
+
+    #[tokio::test]
+    async fn watch_stops_on_401_403_429_without_retrying() {
+        for status in ["401 Unauthorized", "403 Forbidden", "429 Too Many Requests"] {
+            let (url, count) = serve_sequence(vec![(status, "{}".into())]).await;
+            let (result, screens) =
+                run_watch(&watch_command(url, None), std::future::pending()).await;
+            let code = &status[..3];
+            let err = result.unwrap_err();
+            assert!(err.contains("watch stopped") && err.contains(code), "{err}");
+            assert_eq!(
+                count.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "{status}"
+            );
+            assert_eq!(screens.len(), 1);
+            assert!(
+                screens[0].contains("Watch stopped after attempt #1"),
+                "{}",
+                screens[0]
+            );
+            assert!(
+                screens[0].contains(&format!("! STOPPED: HTTP status {code}")),
+                "{}",
+                screens[0]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn watch_keeps_the_last_table_when_it_is_stopped_by_429() {
+        let (url, _) = serve_sequence(vec![
+            ("200 OK", gql("0.30", "0.10")),
+            ("429 Too Many Requests", "{}".into()),
+        ])
+        .await;
+        let (result, screens) = run_watch(&watch_command(url, None), std::future::pending()).await;
+        assert!(result.unwrap_err().contains("429"));
+        assert_eq!(screens.len(), 2);
+        assert!(
+            screens[1].contains("! STOPPED") && screens[1].contains("0.30"),
+            "{}",
+            screens[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_retries_other_errors_and_reports_no_success() {
+        let (url, count) = serve_sequence(vec![("500 Internal Server Error", "{}".into())]).await;
+        let (result, screens) =
+            run_watch(&watch_command(url, Some(2)), std::future::pending()).await;
+        let err = result.unwrap_err();
+        assert!(err.contains("no successful read in 2 attempt(s)"), "{err}");
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(
+            screens.iter().all(|s| s.contains("No successful read yet")),
+            "{screens:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_treats_graphql_errors_and_bad_payloads_as_failed_attempts() {
+        let (url, _) = serve_sequence(vec![
+            ("200 OK", gql("0.30", "0.10")),
+            (
+                "200 OK",
+                r#"{"errors":[{"message":"boom"}],"data":null}"#.into(),
+            ),
+            ("200 OK", "<html>".into()),
+        ])
+        .await;
+        let (result, screens) =
+            run_watch(&watch_command(url, Some(3)), std::future::pending()).await;
+        assert_eq!(result, Ok(()));
+        assert!(
+            screens[1].contains("the source reported errors: boom") && screens[1].contains("0.30")
+        );
+        assert!(screens[2].contains("invalid JSON") && screens[2].contains("0.30"));
+    }
+
+    #[tokio::test]
+    async fn watch_stops_on_ctrl_c_during_a_request_and_during_the_pause() {
+        // Ctrl+C while a request hangs
+        let hanging = serve_once(None).await;
+        let started = std::time::Instant::now();
+        let stop = tokio::time::sleep(Duration::from_millis(200));
+        let (result, screens) = run_watch(&watch_command(hanging, None), stop).await;
+        assert_eq!(result, Ok(()));
+        assert!(screens.is_empty() && started.elapsed() < Duration::from_secs(5));
+        // Ctrl+C during the pause between two attempts
+        let (url, count) = serve_sequence(vec![("200 OK", gql("0.30", "0.10"))]).await;
+        let mut command = watch_command(url, None);
+        command.interval = Some(Duration::from_secs(60));
+        let started = std::time::Instant::now();
+        let stop = tokio::time::sleep(Duration::from_millis(400));
+        let (result, screens) = run_watch(&command, stop).await;
+        assert_eq!(result, Ok(()));
+        assert_eq!(screens.len(), 1);
+        assert!(
+            screens[0].trim_end().ends_with("Stopped."),
+            "{}",
+            screens[0]
+        );
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn watch_command_arguments() {
+        let w = parse_stats_command(args(&["--stats-url", "u", "--watch"])).unwrap();
+        assert!(w.watch && !w.json);
+        assert_eq!(
+            (w.interval, w.max_polls),
+            (Some(Duration::from_secs(30)), None)
+        );
+        let w =
+            parse_stats_command(args(&["--watch", "--interval", "5", "--stats-url", "u"])).unwrap();
+        assert_eq!(w.interval, Some(Duration::from_secs(5)));
+        let w = parse_stats_command(args(&[
+            "--stats-url",
+            "u",
+            "--watch",
+            "--interval",
+            "0.25",
+            "--max-polls",
+            "3",
+        ]))
+        .unwrap();
+        assert_eq!(
+            (w.interval, w.max_polls),
+            (Some(Duration::from_millis(250)), Some(3))
+        );
+        // the single read keeps its defaults
+        let one = parse_stats_command(args(&["--stats-url", "u"])).unwrap();
+        assert_eq!(
+            (one.watch, one.interval, one.max_polls),
+            (false, None, None)
+        );
+        let e = parse_stats_command(args(&["--stats-url", "u", "--watch", "--json"])).unwrap_err();
+        assert!(e.contains("--watch cannot be combined with --json"), "{e}");
+        for bad in [
+            &["--stats-url", "u", "--interval", "5"][..],
+            &["--stats-url", "u", "--max-polls", "2"],
+            &["--stats-url", "u", "--watch", "--interval"],
+            &["--stats-url", "u", "--watch", "--interval", "0"],
+            &["--stats-url", "u", "--watch", "--interval", "-3"],
+            &["--stats-url", "u", "--watch", "--interval", "abc"],
+            &["--stats-url", "u", "--watch", "--interval", ""],
+            &["--stats-url", "u", "--watch", "--interval", "NaN"],
+            &["--stats-url", "u", "--watch", "--interval", "inf"],
+            &["--stats-url", "u", "--watch", "--interval", "86401"],
+            &[
+                "--stats-url",
+                "u",
+                "--watch",
+                "--interval",
+                "5",
+                "--interval",
+                "6",
+            ],
+            &["--stats-url", "u", "--watch", "--watch"],
+            &["--stats-url", "u", "--watch", "--max-polls", "0"],
+            &["--watch"],
+        ] {
+            assert!(parse_stats_command(args(bad)).is_err(), "{bad:?}");
+        }
+    }
+
     #[tokio::test]
     async fn fetches_and_parses_the_local_graphql_fixture() {
         let body = include_str!("../fixtures/flashscore/stats_graphql.json").to_string();
@@ -798,18 +1228,19 @@ mod tests {
         let client = source::build_client().unwrap();
         let url = serve_once(Some(("503 Service Unavailable", "{}".into()))).await;
         let e = fetch_team_stats(&client, &url).await.unwrap_err();
-        assert!(e.contains("returned HTTP status 503"), "{e}");
+        assert_eq!(e.status, Some(503));
+        assert!(e.message.contains("returned HTTP status 503"), "{e}");
 
         let gql = r#"{"errors":[{"message":"PersistedQueryNotFound"}],"data":null}"#;
         let url = serve_once(Some(("200 OK", gql.into()))).await;
-        let e = fetch_team_stats(&client, &url).await.unwrap_err();
+        let e = fetch_team_stats(&client, &url).await.unwrap_err().message;
         assert!(
             e.contains("the source reported errors: PersistedQueryNotFound"),
             "{e}"
         );
 
         let url = serve_once(Some(("200 OK", "<html>blocked</html>".into()))).await;
-        let e = fetch_team_stats(&client, &url).await.unwrap_err();
+        let e = fetch_team_stats(&client, &url).await.unwrap_err().message;
         assert!(e.contains("invalid JSON"), "{e}");
 
         let url = serve_once(Some((
@@ -817,13 +1248,13 @@ mod tests {
             r#"{"data":{"findEventById":null}}"#.into(),
         )))
         .await;
-        let e = fetch_team_stats(&client, &url).await.unwrap_err();
+        let e = fetch_team_stats(&client, &url).await.unwrap_err().message;
         assert!(e.contains("data.findEventById.teamStats.entries"), "{e}");
 
         let e = fetch_team_stats(&client, "http://127.0.0.1:1/x")
             .await
             .unwrap_err();
-        assert!(e.contains("failed"), "{e}");
+        assert!(e.status.is_none() && e.message.contains("failed"), "{e}");
     }
 
     #[tokio::test]
@@ -834,7 +1265,7 @@ mod tests {
             .build()
             .unwrap();
         let started = std::time::Instant::now();
-        let e = fetch_team_stats(&client, &url).await.unwrap_err();
+        let e = fetch_team_stats(&client, &url).await.unwrap_err().message;
         assert!(e.contains("timed out"), "{e}");
         assert!(started.elapsed() < Duration::from_secs(5));
     }
