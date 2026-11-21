@@ -255,6 +255,46 @@ kill %1
 ./scripts/demo.sh flashscore
 ```
 
+#### Statistics (local replay)
+
+`--stats-file <path>` adds the statistics feed (`df_st_1_<match id>`) to a **local
+replay only**: it reads two files from disk (never contacts Flashscore), needs a core
+feed file, `--format flashscore` and the team names, and prints one JSON with the
+score and a `statistics` list. It is not available with `--url`/polling, and the
+Kafka message, PostgreSQL and API are unchanged (statistics are not stored yet).
+
+`fixtures/flashscore/stats_full.txt` is **synthetic**: it imitates the *historical*
+feed format handled by the reference project's `FlashscoreProvider`. It is not a
+recorded response, and the current live Flashscore format has not been verified.
+
+```sh
+cargo run -- fixtures/flashscore/core_2-1.txt --format flashscore \
+  --home-team "Lech Poznań" --away-team "Legia Warszawa" \
+  --stats-file fixtures/flashscore/stats_full.txt
+```
+
+Records are split on `~`, fields on `¬`, key and value on `÷`. `SE` sets the
+period, `SG` is the statistic name, `SH`/`SI` are the home/away values. Every
+`SG` row becomes one entry `{period, name, home, away}`, so periods (including
+unknown names), repeated names and metrics that are new need no code change.
+A row seen before any `SE` gets `"period": null`; it is never assigned to `Match`.
+Each value keeps `raw` and adds `kind` plus numbers where unambiguous:
+
+| raw | kind | value | numerator / denominator |
+|---|---|---|---|
+| `12` / `-3` | `integer` | 12 / -3 | |
+| `1.87` | `decimal` | 1.87 | |
+| `58%` | `percent` | 58 | |
+| `18/24` | `fraction` | `null` | 18 / 24 |
+| `75% (18/24)` | `percent_fraction` | 75 | 18 / 24 |
+| absent or empty | `missing` | `null` (`raw` is `null`) | |
+| anything else (`n/a`) | `text` | `null` | |
+
+A real `0` is `integer` with value 0, never `missing`. An empty payload, a payload
+without any `SG` row, a row with values but no name, or conflicting duplicate
+fields in one row is an error. Unlike the reference parser, no period is dropped
+and no missing value becomes 0.
+
 ## Test
 
 ```sh

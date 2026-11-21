@@ -1,0 +1,4 @@
+SE÷Match¬~SG÷Expected goals (xG)¬SH÷1.87¬SI÷0.64¬~SG÷Ball possession¬SH÷58%¬SI÷42%¬~SG÷Total shots¬SH÷14¬SI÷6¬~SG÷Crosses¬SH÷75% (18/24)¬SI÷33% (4/12)¬~SG÷Tackles¬SH÷18/24¬SI÷11/15¬~SG÷Offsides¬SH÷3¬SI÷¬~SG÷Red cards¬SH÷0¬SI÷0¬~SG÷Throw-ins¬SH÷21¬SI÷17¬~SG÷Dribbles¬SH÷n/a¬SI÷9¬~
+SE÷1st Half¬~SG÷Expected goals (xG)¬SH÷0.92¬SI÷0.11¬~SG÷Total shots¬SH÷7¬SI÷2¬~SG÷Red cards¬SH÷0¬SI÷0¬~
+SE÷2nd Half¬~SG÷Expected goals (xG)¬SH÷0.95¬SI÷0.53¬~SG÷Total shots¬SH÷7¬SI÷4¬~
+SE÷Extra Time¬~SG÷Total shots¬SH÷2¬SI÷1¬~

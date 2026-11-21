@@ -2,6 +2,7 @@ mod flashscore;
 mod kafka;
 mod parser;
 mod source;
+mod stats;
 
 use std::{env, process::ExitCode, time::Duration};
 
@@ -10,12 +11,15 @@ use serde::Serialize;
 
 use kafka::{KafkaConfig, Publisher};
 use parser::{MatchSnapshot, ParseError, parse_match};
+use stats::StatRecord;
 
 const USAGE: &str = "usage: sport-stream <path-to-html>
        sport-stream --url <http-url> [--poll-seconds <N> [--max-polls <N>]
                     [--kafka-brokers <host:port> --match-id <id>]]
        add --format flashscore --home-team <name> --away-team <name> to read a
-       Flashscore core feed instead of HTML (default: --format html)";
+       Flashscore core feed instead of HTML (default: --format html)
+       sport-stream <core-feed-file> --format flashscore --home-team <name> --away-team <name>
+                    --stats-file <stats-feed-file>   (local replay: score + statistics as one JSON)";
 
 /// How the fetched text is turned into a snapshot.
 #[derive(Debug, PartialEq, Eq)]
@@ -39,16 +43,20 @@ impl Format {
     }
 }
 
-/// Splits off `--format`, `--home-team` and `--away-team`; the rest goes to `parse_args`.
-fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<(Input, Format), String> {
+/// Splits off `--format`, `--home-team`, `--away-team` and `--stats-file`; the rest goes to
+/// `parse_args`. The third element is the optional statistics feed file for local replay.
+fn parse_cli(
+    args: impl IntoIterator<Item = String>,
+) -> Result<(Input, Format, Option<String>), String> {
     let mut args = args.into_iter();
-    let (mut format, mut home, mut away) = (None, None, None);
+    let (mut format, mut home, mut away, mut stats_file) = (None, None, None, None);
     let mut rest = Vec::new();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--format" => once(&mut format, &arg, text(&arg, args.next())?)?,
             "--home-team" => once(&mut home, &arg, text(&arg, args.next())?)?,
             "--away-team" => once(&mut away, &arg, text(&arg, args.next())?)?,
+            "--stats-file" => once(&mut stats_file, &arg, text(&arg, args.next())?)?,
             _ => rest.push(arg),
         }
     }
@@ -74,7 +82,13 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<(Input, Format), 
             ));
         }
     };
-    Ok((parse_args(rest)?, format))
+    let input = parse_args(rest)?;
+    if stats_file.is_some() && !(matches!(input, Input::File(_)) && format != Format::Html) {
+        return Err(format!(
+            "--stats-file needs a local core feed file and --format flashscore\n{USAGE}"
+        ));
+    }
+    Ok((input, format, stats_file))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -178,6 +192,22 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Input, String> {
     }
 }
 
+/// Local replay output: the score snapshot fields plus every statistics row.
+#[derive(Serialize)]
+struct Report<'a> {
+    #[serde(flatten)]
+    snapshot: &'a MatchSnapshot,
+    statistics: &'a [StatRecord],
+}
+
+fn render_report(snapshot: &MatchSnapshot, statistics: &[StatRecord]) -> Result<String, String> {
+    serde_json::to_string_pretty(&Report {
+        snapshot,
+        statistics,
+    })
+    .map_err(|e| format!("cannot serialize: {e}"))
+}
+
 fn render(snapshot: &MatchSnapshot) -> Result<String, String> {
     serde_json::to_string_pretty(snapshot).map_err(|e| format!("cannot serialize: {e}"))
 }
@@ -243,7 +273,7 @@ async fn poll(
 }
 
 async fn run() -> Result<(), String> {
-    let (input, format) = parse_cli(env::args().skip(1))?;
+    let (input, format, stats_file) = parse_cli(env::args().skip(1))?;
     let (body, origin) = match input {
         Input::File(path) => (source::read_file(&path)?, path),
         Input::Url(url) => {
@@ -260,6 +290,13 @@ async fn run() -> Result<(), String> {
     let snapshot = format
         .parse(&body)
         .map_err(|e| format!("cannot parse {origin}: {e}"))?;
+    if let Some(stats_path) = stats_file {
+        let stats_body = source::read_file(&stats_path)?;
+        let statistics = stats::parse_stats_feed(&stats_body)
+            .map_err(|e| format!("cannot parse {stats_path}: {e}"))?;
+        println!("{}", render_report(&snapshot, &statistics)?);
+        return Ok(());
+    }
     println!("{}", render(&snapshot)?);
     Ok(())
 }
@@ -297,12 +334,12 @@ mod tests {
 
     #[test]
     fn parses_format_options() {
-        let (input, format) = parse_cli(args(&["a.html"])).unwrap();
+        let (input, format, stats) = parse_cli(args(&["a.html"])).unwrap();
         assert_eq!(
-            (input, format),
-            (Input::File("a.html".into()), Format::Html)
+            (input, format, stats),
+            (Input::File("a.html".into()), Format::Html, None)
         );
-        let (input, format) = parse_cli(args(&[
+        let (input, format, stats) = parse_cli(args(&[
             "--url",
             "http://x",
             "--format",
@@ -314,6 +351,7 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(input, Input::Url("http://x".into()));
+        assert_eq!(stats, None);
         assert_eq!(
             format,
             Format::Flashscore {
@@ -343,6 +381,40 @@ mod tests {
         ] {
             assert!(parse_cli(args(bad)).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn stats_file_needs_flashscore_and_a_local_file() {
+        let flash = [
+            "--format",
+            "flashscore",
+            "--home-team",
+            "A",
+            "--away-team",
+            "B",
+        ];
+        let with = |extra: &[&str]| {
+            let all: Vec<&str> = flash.iter().chain(extra).copied().collect();
+            parse_cli(args(&all))
+        };
+        let (input, _, stats) = with(&["core.txt", "--stats-file", "stats.txt"]).unwrap();
+        assert_eq!(input, Input::File("core.txt".into()));
+        assert_eq!(stats.as_deref(), Some("stats.txt"));
+        assert!(with(&["--url", "http://x", "--stats-file", "s"]).is_err());
+        assert!(with(&["core.txt", "--stats-file"]).is_err());
+        assert!(with(&["core.txt", "--stats-file", "a", "--stats-file", "b"]).is_err());
+        assert!(parse_cli(args(&["core.txt", "--stats-file", "s"])).is_err());
+    }
+
+    #[test]
+    fn report_has_score_and_statistics() {
+        let snap = flashscore::parse_core_feed("DE÷1¬DF÷0¬", "A", "B").unwrap();
+        let rows = stats::parse_stats_feed("SE÷Match¬~SG÷Fouls¬SH÷0¬SI÷¬~").unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&render_report(&snap, &rows).unwrap()).unwrap();
+        assert_eq!(json["home_score"], 1);
+        assert_eq!(json["statistics"][0]["home"]["value"], 0);
+        assert!(json["statistics"][0]["away"]["raw"].is_null());
     }
 
     #[test]
