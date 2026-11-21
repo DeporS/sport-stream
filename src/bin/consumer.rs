@@ -302,6 +302,25 @@ mod tests {
     }
 
     #[test]
+    fn graphql_records_are_stored_unchanged() {
+        let record = r#"{"period":null,"event_stage_id":74,"name":"expected_goals","home":{"raw":"0.34","kind":"decimal","value":0.34,"numerator":null,"denominator":null,"raw_value":"0.3389","sub_value":"(80%)"},"away":{"raw":null,"kind":"missing","value":null,"numerator":null,"denominator":null}}"#;
+        let mut message: serde_json::Value = serde_json::from_str(VALID).unwrap();
+        message["statistics"] = serde_json::json!({
+            "observed_at": "2026-01-02T03:04:06Z",
+            "records": [serde_json::from_str::<serde_json::Value>(record).unwrap()],
+        });
+        let s = decode(message.to_string().as_bytes())
+            .unwrap()
+            .statistics
+            .unwrap();
+        let original: serde_json::Value = serde_json::from_str(record).unwrap();
+        assert_eq!(s.records[0], original);
+        assert_eq!(s.records[0]["event_stage_id"], 74);
+        assert_eq!(s.records[0]["home"]["raw_value"], "0.3389");
+        assert_eq!(s.records[0]["home"]["sub_value"], "(80%)");
+    }
+
+    #[test]
     fn rejects_malformed_statistics() {
         for bad in [
             r#"{"observed_at":"2026-01-02T03:04:06Z","records":[1]}"#,

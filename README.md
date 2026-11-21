@@ -196,7 +196,7 @@ one. Timestamps are stored with microsecond precision.
 ## One-command demo
 
 ```sh
-./scripts/demo.sh            # HTML replay; `flashscore` for the feed replay, `stats` adds statistics
+./scripts/demo.sh            # HTML replay; `flashscore` for the feed replay, `stats` adds statistics, `live` is the terminal view
 ```
 
 The script starts Kafka and PostgreSQL in its own Compose project
@@ -383,29 +383,38 @@ in order of first appearance and assigned to `home`/`away` by `teamId`:
   an unknown `teamId` or a malformed entry are errors, not silently overwritten.
 - A GraphQL `errors` list, missing/`null`/empty `entries`, empty payload or invalid JSON are errors.
 
-#### Real statistics in the terminal (one GET, no pipeline)
+#### Live view in the terminal
 
-`sport-stream stats` fetches the Flashscore team statistics (GraphQL JSON,
-`data.findEventById.teamStats.entries`) **once** and prints them. It needs no match score, Docker,
-Kafka, database or local server, and uses the same parser as the replays. Quote the URL (it
-contains `&`):
+`--stats-format json` also works with `--stats-url` while polling, so GraphQL statistics go through
+the same Kafka -> PostgreSQL -> `/statistics` path (`period` is `null`, `event_stage_id`,
+`raw_value` and `sub_value` are stored and returned as sent):
 
 ```sh
-cargo run --quiet -- stats --stats-url 'https://2.ds.lsapp.eu/pq_graphql?_hash=dts&eventId=<event id>&providerId=101'
-cargo run --quiet -- stats --stats-url '<url>' --json     # JSON including rawValue
+cargo run -- --url http://127.0.0.1:8000/feed/dc_1_demo --poll-seconds 4 --format flashscore \
+  --home-team "Lech Poznań" --away-team "Legia Warszawa" \
+  --stats-url http://127.0.0.1:8000/graphql/team-stats --stats-format json \
+  --home-team-id synthHome --away-team-id synthAway \
+  --kafka-brokers 127.0.0.1:9092 --match-id demo-lech-legia
 ```
 
-- Output: the fetch time and HTTP status, then one table per `eventStageId` with **all** metrics.
-  Nothing is hard-coded: the numbers of entries, teams, stages and metrics come from the response.
-- Columns are headed by **team ids**, sorted by id: the response does not say who is the home team,
-  so no role is assumed from the order of the entries. Stages are labelled by their id in order of
-  appearance (`name not confirmed`), no period name is guessed.
-- A cell shows `value` and, if present, `subValue` (`443 (92%)`); `-` means no value or no entry for
-  that team. `rawValue` appears only with `--json`, together with `value` and `subValue` per team.
-- One request with a 10 s timeout. A failed HTTP request (status, connection, timeout), GraphQL
-  `errors`, a body that is not JSON and a payload without `teamStats.entries` each exit with code 1
-  and a one-line `error: ...`.
-- A local file literally named `stats` must now be passed as `./stats` (`stats` is the command).
+One command starts everything locally (Docker, synthetic data, nothing is sent to Flashscore) and
+shows what reached the API:
+
+```sh
+./scripts/demo.sh live
+```
+
+A local server returns a new score every `LIVE_POLL_SECONDS` (default 4) seconds, `0:0`, `1:0`,
+`2:1` and `3:1`, and new GraphQL statistics for the first three; its statistics request for the
+fourth poll fails (HTTP 500), as it can in real life. `scripts/live_view.py` reads `/state` and
+`/statistics` from the API and redraws a `metric / home / away` table per period (an unnamed period
+is labelled `eventStageId <id>`; a missing value is `-`). The newest score is always shown. When the
+newest observation has no statistics (as after the fourth poll), the tables are the previous
+reading's and a banner says so: *STATISTICS ARE FROM AN EARLIER READING*, with the time of the
+newest reading, the time the statistics were read and the score at that time. The last screen
+stays until Ctrl+C, which stops only the processes and the Docker project started by the script.
+`LIVE_UPDATES=4 ./scripts/demo.sh live` runs it non-interactively and checks the API fields and the
+viewer output.
 
 ## Test
 

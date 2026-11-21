@@ -2,12 +2,16 @@
 # Repeatable sport-stream demo: HTML -> collector -> Kafka -> consumer -> PostgreSQL -> API.
 # Uses its own Docker Compose project (sport-stream-demo); it never touches other containers.
 #
-# Usage: scripts/demo.sh [html|flashscore|stats]   (default: html)
+# Usage: scripts/demo.sh [html|flashscore|stats|live]   (default: html)
 #   html        replays a synthetic HTML page
 #   flashscore  replays a synthetic Flashscore core feed (offline, nothing is sent to Flashscore)
 #   stats       flashscore replay with statistics: xG 0.42, then 1.20, then a poll whose statistics
 #               request fails (score only), plus one hand-written score-only message in the
 #               old format; checks GET /matches/{id}/statistics (offline, nothing is sent to Flashscore)
+#   live        terminal view: a collector polls a local server (score + GraphQL JSON statistics every
+#               few seconds), the data goes Kafka -> consumer -> PostgreSQL -> API and scripts/live_view.py
+#               redraws the tables from the API until Ctrl+C (offline, nothing is sent to Flashscore).
+#               LIVE_POLL_SECONDS (default 4) sets the interval; LIVE_UPDATES=N exits after N readings.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -24,7 +28,12 @@ case "$MODE" in
     COLLECTOR_FORMAT=(--format flashscore --home-team "Lech Poznań" --away-team "Legia Warszawa"
       --stats-url "http://127.0.0.1:8000/feed/df_st_demo")
     EXPECTED_MESSAGES=4 ;;
-  *) printf 'usage: %s [html|flashscore|stats]\n' "$0" >&2; exit 2 ;;
+  live)
+    SOURCE_PATH=feed/dc_1_live
+    COLLECTOR_FORMAT=(--format flashscore --home-team "Lech Poznań" --away-team "Legia Warszawa"
+      --stats-url "http://127.0.0.1:8000/graphql/team-stats" --stats-format json
+      --home-team-id synthHome --away-team-id synthAway) ;;
+  *) printf 'usage: %s [html|flashscore|stats|live]\n' "$0" >&2; exit 2 ;;
 esac
 
 PROJECT=sport-stream-demo
@@ -114,6 +123,69 @@ log "starting HTML server on :$HTML_PORT"
 python3 scripts/demo_server.py "$HTML_PORT" >"$WORK/html-server.log" 2>&1 &
 PIDS+=($!)
 wait_for "HTML server" 10 curl -sf "http://127.0.0.1:$HTML_PORT/healthz"
+
+# --- live view (live mode only) ----------------------------------------------
+if [ "$MODE" = live ]; then
+  POLL=${LIVE_POLL_SECONDS:-4}
+  log "starting the consumer (it also creates the schema)"
+  "$BIN/consumer" --group-id "demo-live-$$-$(date +%s)" >"$WORK/consumer.log" 2>&1 &
+  PIDS+=($!)
+  wait_for "database schema" 60 compose exec -T postgres psql -U sport -d sport_stream -Atc "SELECT 1 FROM match_observations LIMIT 1"
+  log "starting the API on :$API_PORT"
+  "$BIN/api" --listen "127.0.0.1:$API_PORT" >"$WORK/api.log" 2>&1 &
+  PIDS+=($!)
+  wait_for "API" 15 curl -sf "http://127.0.0.1:$API_PORT/matches/$MATCH_ID/observations"
+  log "starting the collector: 4 readings, one every ${POLL}s (score + statistics)"
+  "$BIN/sport-stream" --url "http://127.0.0.1:$HTML_PORT/$SOURCE_PATH" "${COLLECTOR_FORMAT[@]}" \
+    --poll-seconds "$POLL" --max-polls 4 \
+    --kafka-brokers "127.0.0.1:$KAFKA_PORT" --match-id "$MATCH_ID" >"$WORK/collector.log" 2>&1 &
+  PIDS+=($!)
+  # The last table stays on screen until Ctrl+C; cleanup then stops only what this script started.
+  VIEW=(python3 scripts/live_view.py --api "http://127.0.0.1:$API_PORT" --match-id "$MATCH_ID")
+  if [ -z "${LIVE_UPDATES:-}" ]; then
+    "${VIEW[@]}"
+    exit $?
+  fi
+  # Scripted run: stop after N redraws, then check what reached the API and what the viewer showed.
+  "${VIEW[@]}" --updates "$LIVE_UPDATES" --no-clear | tee "$WORK/live-view.out"
+  API="http://127.0.0.1:$API_PORT/matches/$MATCH_ID"
+  LIVE_STATS=$(curl -sf "$API/statistics") || die "statistics request failed"
+  LIVE_STATE=$(curl -sf "$API/state") || die "state request failed"
+  LIVE_HISTORY=$(curl -sf "$API/observations") || die "history request failed"
+  grep -q "statistics skipped" "$WORK/collector.log" || die "collector did not report the failed statistics request"
+  echo "collector stderr: $(grep 'statistics skipped' "$WORK/collector.log" | head -1)"
+  LIVE_STATS="$LIVE_STATS" LIVE_STATE="$LIVE_STATE" LIVE_HISTORY="$LIVE_HISTORY" LIVE_VIEW_OUT="$WORK/live-view.out" python3 - <<'PY'
+import json, os, sys
+stats, state, hist = (json.loads(os.environ[k]) for k in ("LIVE_STATS", "LIVE_STATE", "LIVE_HISTORY"))
+view = open(os.environ["LIVE_VIEW_OUT"], encoding="utf-8").read()
+last_screen = view.split("=" * 72)[-1]
+recs = stats["statistics"]
+xg = next(r for r in recs if r["name"] == "expected_goals" and r["event_stage_id"] == 74)
+passes = next(r for r in recs if r["name"] == "calculated_completed_passes" and r["event_stage_id"] == 74)
+throw = next(r for r in recs if r["name"] == "throw_in" and r["event_stage_id"] == 74)
+scores = [f'{o["snapshot"]["home_score"]}:{o["snapshot"]["away_score"]}' for o in hist]
+print("API /statistics xG (stage 74):", json.dumps({s: {k: xg[s][k] for k in ("raw", "raw_value")} for s in ("home", "away")}))
+print("API /statistics completed passes home:", json.dumps({k: passes["home"][k] for k in ("raw", "raw_value", "sub_value")}))
+print("API /state:", f'{state["snapshot"]["home_score"]}:{state["snapshot"]["away_score"]}', "read at", state["observed_at"],
+      "| /statistics observation read at", stats["observed_at"])
+checks = {
+  "4 observations, score 0:0 -> 1:0 -> 2:1 -> 3:1": scores == ["3:1", "2:1", "1:0", "0:0"],
+  "newest observation has no statistics: /statistics returns an earlier one": stats["observed_at"] < state["observed_at"],
+  "18 records, 9 per eventStageId (74 and 12), period null": len(recs) == 18 and {r["event_stage_id"] for r in recs} == {74, 12} and all(r["period"] is None for r in recs),
+  "raw_value reached the API (last xG 1.20 / 1.2000)": xg["home"]["raw"] == "1.20" and xg["home"]["raw_value"] == "1.2000",
+  "sub_value reached the API": passes["home"]["sub_value"] == "(86%)",
+  "missing value stays missing (throw_in away)": throw["away"]["raw"] is None and throw["away"]["kind"] == "missing",
+  "viewer: last screen shows the NEWEST score 3 : 1": "Lech Poznań  3 : 1  Legia Warszawa" in last_screen,
+  "viewer: last screen marks the statistics as an earlier reading (score then 2 : 1)": "STATISTICS ARE FROM AN EARLIER READING" in last_screen and "when the score was 2 : 1" in last_screen,
+  "viewer: earlier screens carry no such mark": view.count("STATISTICS ARE FROM AN EARLIER READING") == 1,
+}
+for name, ok in checks.items():
+    print(("ok   " if ok else "FAIL ") + name)
+print("RESULT:", "OK" if all(checks.values()) else "MISMATCH")
+sys.exit(0 if all(checks.values()) else 1)
+PY
+  exit $?
+fi
 
 # --- pipeline ---------------------------------------------------------------
 log "collecting three observations (mode: $MODE)"

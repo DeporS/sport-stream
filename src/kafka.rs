@@ -115,6 +115,45 @@ mod tests {
     }
 
     #[test]
+    fn graphql_statistics_keep_stage_id_raw_value_and_sub_value() {
+        let snap = MatchSnapshot {
+            home_team: "A".into(),
+            away_team: "B".into(),
+            home_score: 1,
+            away_score: 0,
+        };
+        let at = DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+            .unwrap()
+            .to_utc();
+        let reading = StatisticsReading {
+            observed_at: at,
+            records: crate::stats_graphql::parse_stats_json(
+                include_str!("../fixtures/flashscore/stats_graphql.json"),
+                "synthHome",
+                "synthAway",
+            )
+            .unwrap(),
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&render_message("demo", &snap, at, Some(&reading)).unwrap())
+                .unwrap();
+        let records = v["statistics"]["records"].as_array().unwrap();
+        assert!(
+            records
+                .iter()
+                .all(|r| r["period"].is_null() && r["event_stage_id"].is_i64())
+        );
+        let xg = &records[0];
+        assert_eq!(xg["name"], "expected_goals");
+        assert_eq!(xg["home"]["raw_value"], "0.3389");
+        let passes = records
+            .iter()
+            .find(|r| r["name"] == "calculated_completed_passes")
+            .unwrap();
+        assert_eq!(passes["home"]["sub_value"], "(80%)");
+    }
+
+    #[test]
     fn statistics_are_an_additive_optional_field() {
         let snap = MatchSnapshot {
             home_team: "A".into(),

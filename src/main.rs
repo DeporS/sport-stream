@@ -32,7 +32,8 @@ const USAGE: &str = "usage: sport-stream <path-to-html>
                     --home-team-id <id> --away-team-id <id>   (statistics in the JSON format)
        sport-stream stats --stats-url <url> [--json]   (print real statistics once, see below)
        sport-stream --url <core-url> --poll-seconds <N> --format flashscore ...
-                    --stats-url <stats-feed-url>     (also fetch statistics in every poll)";
+                    --stats-url <stats-feed-url>     (also fetch statistics in every poll;
+                    add --stats-format json --home-team-id <id> --away-team-id <id> for GraphQL JSON)";
 
 /// How the fetched text is turned into a snapshot.
 #[derive(Debug, PartialEq, Eq)]
@@ -163,9 +164,9 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
             if home_team_id == away_team_id {
                 return Err("--home-team-id and --away-team-id must differ".to_string());
             }
-            if stats_file.is_none() {
+            if stats_file.is_none() && stats_url.is_none() {
                 return Err(format!(
-                    "--stats-format json is only supported with --stats-file (local replay)\n{USAGE}"
+                    "--stats-format json needs --stats-file (local replay) or --stats-url (polling)\n{USAGE}"
                 ));
             }
             StatsFormat::Json {
@@ -338,9 +339,12 @@ fn render_observation(
 fn statistics_reading(
     fetched: Result<(String, DateTime<Utc>), String>,
     url: &str,
+    format: &StatsFormat,
 ) -> Result<StatisticsReading, String> {
     let (body, observed_at) = fetched?;
-    let records = stats::parse_stats_feed(&body).map_err(|e| format!("cannot parse {url}: {e}"))?;
+    let records = format
+        .parse(&body)
+        .map_err(|e| format!("cannot parse {url}: {e}"))?;
     Ok(StatisticsReading {
         observed_at,
         records,
@@ -355,16 +359,16 @@ async fn poll_once(
     publisher: Option<&Publisher>,
     format: &Format,
     url: &str,
-    stats_url: Option<&str>,
+    stats: Option<(&str, &StatsFormat)>,
 ) -> Result<String, String> {
     let (body, observed_at) = source::fetch_url(client, url).await?;
     let snapshot = format
         .parse(&body)
         .map_err(|e| format!("cannot parse {url}: {e}"))?;
-    let statistics = match stats_url {
-        Some(stats_url) => {
+    let statistics = match stats {
+        Some((stats_url, stats_format)) => {
             let fetched = source::fetch_url(client, stats_url).await;
-            match statistics_reading(fetched, stats_url) {
+            match statistics_reading(fetched, stats_url, stats_format) {
                 Ok(reading) => Some(reading),
                 Err(e) => {
                     eprintln!("error: statistics skipped, publishing the score only: {e}");
@@ -387,7 +391,7 @@ async fn poll_once(
 async fn poll(
     format: &Format,
     url: &str,
-    stats_url: Option<&str>,
+    stats: Option<(&str, &StatsFormat)>,
     interval: Duration,
     max_polls: Option<u64>,
     kafka: Option<KafkaConfig>,
@@ -397,7 +401,7 @@ async fn poll(
     let (mut attempts, mut successes) = (0u64, 0u64);
     loop {
         attempts += 1;
-        match poll_once(&client, publisher.as_ref(), format, url, stats_url).await {
+        match poll_once(&client, publisher.as_ref(), format, url, stats).await {
             Ok(line) => {
                 successes += 1;
                 println!("{line}");
@@ -490,7 +494,7 @@ async fn run() -> Result<(), String> {
             return poll(
                 &format,
                 &url,
-                stats_url.as_deref(),
+                stats_url.as_deref().map(|url| (url, &stats_format)),
                 interval,
                 max_polls,
                 kafka,
@@ -709,21 +713,7 @@ mod tests {
                 "a",
             ],
             &["core.txt", "--stats-file", "s", "--stats-format", "xml"],
-            // json is a local replay only
-            &[
-                "--url",
-                "u",
-                "--poll-seconds",
-                "2",
-                "--stats-url",
-                "s",
-                "--stats-format",
-                "json",
-                "--home-team-id",
-                "h",
-                "--away-team-id",
-                "a",
-            ],
+            // json needs a statistics source (--stats-file or --stats-url)
             &[
                 "core.txt",
                 "--stats-format",
@@ -850,6 +840,59 @@ mod tests {
     }
 
     #[test]
+    fn stats_url_accepts_the_json_format() {
+        let cli = parse_cli(args(&[
+            "--url",
+            "http://x/core",
+            "--poll-seconds",
+            "2",
+            "--format",
+            "flashscore",
+            "--home-team",
+            "A",
+            "--away-team",
+            "B",
+            "--stats-url",
+            "http://x/gql",
+            "--stats-format",
+            "json",
+            "--home-team-id",
+            "h1",
+            "--away-team-id",
+            "a1",
+        ]))
+        .unwrap();
+        assert_eq!(cli.stats_url.as_deref(), Some("http://x/gql"));
+        assert_eq!(
+            cli.stats_format,
+            StatsFormat::Json {
+                home_team_id: "h1".into(),
+                away_team_id: "a1".into()
+            }
+        );
+    }
+
+    #[test]
+    fn json_statistics_reading_uses_the_json_parser_and_reports_errors() {
+        let at = Utc::now();
+        let fmt = StatsFormat::Json {
+            home_team_id: "h".into(),
+            away_team_id: "a".into(),
+        };
+        let ok = r#"{"data":{"findEventById":{"teamStats":{"entries":[{"typeId":"expected_goals","value":"0.34","subValue":null,"rawValue":"0.3389","eventStageId":74,"teamId":"h"}]}}}}"#;
+        let reading = statistics_reading(Ok((ok.into(), at)), "u", &fmt).unwrap();
+        assert_eq!((reading.observed_at, reading.records.len()), (at, 1));
+        assert_eq!(reading.records[0].event_stage_id, Some(74));
+        // The text parser rejects the same body, the JSON parser rejects text and GraphQL errors.
+        assert!(statistics_reading(Ok((ok.into(), at)), "u", &StatsFormat::Text).is_err());
+        let text = "SE÷Match¬~SG÷Fouls¬SH÷1¬SI÷2¬~";
+        assert!(statistics_reading(Ok((text.into(), at)), "u", &fmt).is_err());
+        let gql_error = r#"{"errors":[{"message":"boom"}],"data":null}"#;
+        let e = statistics_reading(Ok((gql_error.into(), at)), "u", &fmt).unwrap_err();
+        assert!(e.contains("boom"), "{e}");
+    }
+
+    #[test]
     fn stats_url_needs_flashscore_polling() {
         let flash = [
             "--format",
@@ -926,18 +969,22 @@ mod tests {
     fn failed_statistics_do_not_produce_a_reading() {
         let at = Utc::now();
         assert!(
-            statistics_reading(Err("boom".into()), "u")
+            statistics_reading(Err("boom".into()), "u", &StatsFormat::Text)
                 .unwrap_err()
                 .contains("boom")
         );
         for body in ["", "garbage", "SE÷Match¬~"] {
             assert!(
-                statistics_reading(Ok((body.into(), at)), "u").is_err(),
+                statistics_reading(Ok((body.into(), at)), "u", &StatsFormat::Text).is_err(),
                 "{body:?}"
             );
         }
-        let ok =
-            statistics_reading(Ok(("SE÷Match¬~SG÷Fouls¬SH÷1¬SI÷2¬~".into(), at)), "u").unwrap();
+        let ok = statistics_reading(
+            Ok(("SE÷Match¬~SG÷Fouls¬SH÷1¬SI÷2¬~".into(), at)),
+            "u",
+            &StatsFormat::Text,
+        )
+        .unwrap();
         assert_eq!((ok.observed_at, ok.records.len()), (at, 1));
     }
 
