@@ -383,6 +383,30 @@ in order of first appearance and assigned to `home`/`away` by `teamId`:
   an unknown `teamId` or a malformed entry are errors, not silently overwritten.
 - A GraphQL `errors` list, missing/`null`/empty `entries`, empty payload or invalid JSON are errors.
 
+#### Real statistics in the terminal (one GET, no pipeline)
+
+`sport-stream stats` fetches the Flashscore team statistics (GraphQL JSON,
+`data.findEventById.teamStats.entries`) **once** and prints them. It needs no match score, Docker,
+Kafka, database or local server, and uses the same parser as the replays. Quote the URL (it
+contains `&`):
+
+```sh
+cargo run --quiet -- stats --stats-url 'https://2.ds.lsapp.eu/pq_graphql?_hash=dts&eventId=<event id>&providerId=101'
+cargo run --quiet -- stats --stats-url '<url>' --json     # JSON including rawValue
+```
+
+- Output: the fetch time and HTTP status, then one table per `eventStageId` with **all** metrics.
+  Nothing is hard-coded: the numbers of entries, teams, stages and metrics come from the response.
+- Columns are headed by **team ids**, sorted by id: the response does not say who is the home team,
+  so no role is assumed from the order of the entries. Stages are labelled by their id in order of
+  appearance (`name not confirmed`), no period name is guessed.
+- A cell shows `value` and, if present, `subValue` (`443 (92%)`); `-` means no value or no entry for
+  that team. `rawValue` appears only with `--json`, together with `value` and `subValue` per team.
+- One request with a 10 s timeout. A failed HTTP request (status, connection, timeout), GraphQL
+  `errors`, a body that is not JSON and a payload without `teamStats.entries` each exit with code 1
+  and a one-line `error: ...`.
+- A local file literally named `stats` must now be passed as `./stats` (`stats` is the command).
+
 ## Test
 
 ```sh

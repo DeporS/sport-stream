@@ -13,7 +13,7 @@
 //! `value` is the displayed text (`StatValue.raw`, interpreted like the text format), `rawValue`
 //! the more precise number and `subValue` extra text such as `(80%)`; all three are kept as sent.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use serde_json::Value;
 
@@ -22,11 +22,12 @@ use crate::stats::{StatRecord, StatValue, classify};
 
 const ENTRIES_PATH: &str = "data.findEventById.teamStats.entries";
 
+/// The three strings of one entry exactly as sent (blank or `null` is `None`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Cell {
-    value: Option<String>,
-    raw_value: Option<String>,
-    sub_value: Option<String>,
+pub struct Cell {
+    pub value: Option<String>,
+    pub raw_value: Option<String>,
+    pub sub_value: Option<String>,
 }
 
 #[derive(Default)]
@@ -89,11 +90,17 @@ fn side_value(cell: Option<&Cell>) -> StatValue {
     v
 }
 
-pub fn parse_stats_json(
-    payload: &str,
-    home_team_id: &str,
-    away_team_id: &str,
-) -> Result<Vec<StatRecord>, ParseError> {
+/// One validated entry of the response, before it is assigned to a side.
+struct Entry {
+    index: usize,
+    stage: i64,
+    type_id: String,
+    team_id: String,
+    cell: Cell,
+}
+
+/// Validates the envelope and every entry. Shared by both parsers; knows nothing about sides.
+fn parse_entries(payload: &str) -> Result<Vec<Entry>, ParseError> {
     if payload.trim().is_empty() {
         return Err(ParseError::EmptyPayload);
     }
@@ -114,50 +121,70 @@ pub fn parse_stats_json(
     if entries.is_empty() {
         return Err(ParseError::MissingField("statistics entries"));
     }
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let entry = entry
+                .as_object()
+                .ok_or_else(|| invalid(index, "not an object"))?;
+            Ok(Entry {
+                index,
+                type_id: required_str(entry, "typeId", index)?.to_string(),
+                team_id: required_str(entry, "teamId", index)?.to_string(),
+                stage: entry
+                    .get("eventStageId")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| invalid(index, "eventStageId must be an integer"))?,
+                cell: Cell {
+                    value: optional_str(entry, "value", index)?,
+                    raw_value: optional_str(entry, "rawValue", index)?,
+                    sub_value: optional_str(entry, "subValue", index)?,
+                },
+            })
+        })
+        .collect()
+}
 
+fn conflict(entry: &Entry) -> ParseError {
+    invalid(
+        entry.index,
+        &format!(
+            "conflicting duplicate for typeId {:?}, eventStageId {}, teamId {:?}",
+            entry.type_id, entry.stage, entry.team_id
+        ),
+    )
+}
+
+pub fn parse_stats_json(
+    payload: &str,
+    home_team_id: &str,
+    away_team_id: &str,
+) -> Result<Vec<StatRecord>, ParseError> {
     let mut order: Vec<(i64, String)> = Vec::new();
     let mut groups: HashMap<(i64, String), Pair> = HashMap::new();
-    for (index, entry) in entries.iter().enumerate() {
-        let entry = entry
-            .as_object()
-            .ok_or_else(|| invalid(index, "not an object"))?;
-        let type_id = required_str(entry, "typeId", index)?;
-        let team_id = required_str(entry, "teamId", index)?;
-        let stage = entry
-            .get("eventStageId")
-            .and_then(Value::as_i64)
-            .ok_or_else(|| invalid(index, "eventStageId must be an integer"))?;
-        let cell = Cell {
-            value: optional_str(entry, "value", index)?,
-            raw_value: optional_str(entry, "rawValue", index)?,
-            sub_value: optional_str(entry, "subValue", index)?,
-        };
-
-        let key = (stage, type_id.to_string());
+    for entry in parse_entries(payload)? {
+        let key = (entry.stage, entry.type_id.clone());
         if !groups.contains_key(&key) {
             order.push(key.clone());
         }
         let pair = groups.entry(key).or_default();
-        let slot = if team_id == home_team_id {
+        let slot = if entry.team_id == home_team_id {
             &mut pair.home
-        } else if team_id == away_team_id {
+        } else if entry.team_id == away_team_id {
             &mut pair.away
         } else {
             return Err(invalid(
-                index,
-                &format!("teamId {team_id:?} is neither the home nor the away team id"),
+                entry.index,
+                &format!(
+                    "teamId {:?} is neither the home nor the away team id",
+                    entry.team_id
+                ),
             ));
         };
         match slot {
-            Some(existing) if *existing != cell => {
-                return Err(invalid(
-                    index,
-                    &format!(
-                        "conflicting duplicate for typeId {type_id:?}, eventStageId {stage}, teamId {team_id:?}"
-                    ),
-                ));
-            }
-            _ => *slot = Some(cell),
+            Some(existing) if *existing != entry.cell => return Err(conflict(&entry)),
+            _ => *slot = Some(entry.cell),
         }
     }
 
@@ -174,6 +201,85 @@ pub fn parse_stats_json(
             }
         })
         .collect())
+}
+
+/// One metric of one stage; `cells` is aligned with `TeamStats::teams` (`None`: no entry).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Metric {
+    pub type_id: String,
+    pub cells: Vec<Option<Cell>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageStats {
+    pub event_stage_id: i64,
+    pub metrics: Vec<Metric>,
+}
+
+/// The whole response without any home/away assumption: columns are the team ids found in the
+/// response (sorted, so the order says nothing about roles), stages and metrics keep the order of
+/// first appearance. Nothing is hard-coded: any number of teams, stages and metrics is accepted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeamStats {
+    /// Number of entries in the response (before identical duplicates are collapsed).
+    pub entries: usize,
+    pub teams: Vec<String>,
+    pub stages: Vec<StageStats>,
+}
+
+pub fn parse_stats_json_by_team(payload: &str) -> Result<TeamStats, ParseError> {
+    let entries = parse_entries(payload)?;
+    let count = entries.len();
+    let teams: Vec<String> = entries
+        .iter()
+        .map(|e| e.team_id.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let column = |team: &str| {
+        teams
+            .iter()
+            .position(|t| t == team)
+            .expect("team was collected")
+    };
+
+    let mut stages: Vec<StageStats> = Vec::new();
+    for entry in entries {
+        let stage = match stages.iter().position(|s| s.event_stage_id == entry.stage) {
+            Some(i) => &mut stages[i],
+            None => {
+                stages.push(StageStats {
+                    event_stage_id: entry.stage,
+                    metrics: Vec::new(),
+                });
+                stages.last_mut().expect("just pushed")
+            }
+        };
+        let metric = match stage
+            .metrics
+            .iter()
+            .position(|m| m.type_id == entry.type_id)
+        {
+            Some(i) => &mut stage.metrics[i],
+            None => {
+                stage.metrics.push(Metric {
+                    type_id: entry.type_id.clone(),
+                    cells: vec![None; teams.len()],
+                });
+                stage.metrics.last_mut().expect("just pushed")
+            }
+        };
+        let slot = &mut metric.cells[column(&entry.team_id)];
+        match slot {
+            Some(existing) if *existing != entry.cell => return Err(conflict(&entry)),
+            _ => *slot = Some(entry.cell),
+        }
+    }
+    Ok(TeamStats {
+        entries: count,
+        teams,
+        stages,
+    })
 }
 
 #[cfg(test)]
@@ -402,6 +508,119 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn by_team_lists_every_team_stage_and_metric_without_roles() {
+        let t = parse_stats_json_by_team(FIXTURE).unwrap();
+        assert_eq!(t.entries, 19);
+        // sorted ids: the order carries no home/away meaning
+        assert_eq!(t.teams, ["synthAway", "synthHome"]);
+        let ids: Vec<_> = t.stages.iter().map(|s| s.event_stage_id).collect();
+        assert_eq!(ids, [74, 12]); // first appearance, not sorted
+        assert_eq!(t.stages[0].metrics.len(), 8);
+        assert_eq!(t.stages[1].metrics.len(), 2);
+        let xg = &t.stages[0].metrics[0];
+        assert_eq!(xg.type_id, "expected_goals");
+        let (away, home) = (xg.cells[0].as_ref().unwrap(), xg.cells[1].as_ref().unwrap());
+        assert_eq!(
+            (away.value.as_deref(), away.raw_value.as_deref()),
+            (Some("1.23"), Some("1.2322"))
+        );
+        assert_eq!(
+            (home.value.as_deref(), home.raw_value.as_deref()),
+            (Some("0.34"), Some("0.3389"))
+        );
+        let passes = t.stages[0]
+            .metrics
+            .iter()
+            .find(|m| m.type_id == "calculated_completed_passes")
+            .unwrap();
+        assert_eq!(
+            passes.cells[1].as_ref().unwrap().sub_value.as_deref(),
+            Some("(80%)")
+        );
+        // one side has no entry -> None, a null value -> a cell without value
+        let touches = t.stages[1]
+            .metrics
+            .iter()
+            .find(|m| m.type_id == "touches_in_opposition_box")
+            .unwrap();
+        assert_eq!(
+            (touches.cells[0].is_some(), touches.cells[1].is_none()),
+            (true, true)
+        );
+        let offsides = t.stages[0]
+            .metrics
+            .iter()
+            .find(|m| m.type_id == "offsides")
+            .unwrap();
+        assert_eq!(offsides.cells[0].as_ref().unwrap().value, None);
+    }
+
+    #[test]
+    fn by_team_accepts_any_number_of_teams_and_stages() {
+        let list = [
+            entry("a", r#""1""#, 5, "t3"),
+            entry("a", r#""2""#, 5, "t1"),
+            entry("a", r#""3""#, 9, "t2"),
+            entry("b", r#""4""#, 9, "t2"),
+            entry("a", r#""5""#, 7, "t1"),
+        ]
+        .join(",");
+        let t = parse_stats_json_by_team(&entries(&list)).unwrap();
+        assert_eq!(t.teams, ["t1", "t2", "t3"]);
+        assert_eq!(
+            t.stages
+                .iter()
+                .map(|s| s.event_stage_id)
+                .collect::<Vec<_>>(),
+            [5, 9, 7]
+        );
+        assert_eq!(t.stages[1].metrics.len(), 2);
+    }
+
+    #[test]
+    fn by_team_applies_the_same_validation() {
+        assert_eq!(parse_stats_json_by_team(""), Err(ParseError::EmptyPayload));
+        assert!(matches!(
+            parse_stats_json_by_team("{nope"),
+            Err(ParseError::Json(_))
+        ));
+        let err = r#"{"errors":[{"message":"boom"}],"data":null}"#;
+        assert_eq!(
+            parse_stats_json_by_team(err),
+            Err(ParseError::SourceErrors("boom".into()))
+        );
+        assert_eq!(
+            parse_stats_json_by_team(r#"{"data":{"findEventById":{"teamStats":{}}}}"#),
+            Err(ParseError::MissingField(ENTRIES_PATH))
+        );
+        let same = entries(&format!(
+            "{},{}",
+            entry("a", r#""1""#, 1, "t1"),
+            entry("a", r#""1""#, 1, "t1")
+        ));
+        assert_eq!(
+            parse_stats_json_by_team(&same).unwrap().stages[0]
+                .metrics
+                .len(),
+            1
+        );
+        let conflict = entries(&format!(
+            "{},{}",
+            entry("a", r#""1""#, 1, "t1"),
+            entry("a", r#""2""#, 1, "t1")
+        ));
+        assert!(
+            matches!(parse_stats_json_by_team(&conflict), Err(ParseError::InvalidEntry(m)) if m.contains("conflicting"))
+        );
+        assert!(matches!(
+            parse_stats_json_by_team(&entries(
+                r#"{"typeId":"x","value":"1","eventStageId":"1","teamId":"t"}"#
+            )),
+            Err(ParseError::InvalidEntry(_))
+        ));
     }
 
     #[test]

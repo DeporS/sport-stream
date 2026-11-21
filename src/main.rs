@@ -4,6 +4,7 @@ mod parser;
 mod source;
 mod stats;
 mod stats_graphql;
+mod stats_view;
 
 use std::{env, process::ExitCode, time::Duration};
 
@@ -13,6 +14,11 @@ use serde::Serialize;
 use kafka::{KafkaConfig, Publisher};
 use parser::{MatchSnapshot, ParseError, parse_match};
 use stats::{StatRecord, StatisticsReading};
+
+const STATS_USAGE: &str = "usage: sport-stream stats --stats-url <url> [--json]
+       Fetches the Flashscore team statistics (GraphQL JSON) once and prints them; it needs no
+       match score, Docker, Kafka or local server. --json prints JSON including rawValue.
+       (A local file literally named `stats` must be given as ./stats.)";
 
 const USAGE: &str = "usage: sport-stream <path-to-html>
        sport-stream --url <http-url> [--poll-seconds <N> [--max-polls <N>]
@@ -24,6 +30,7 @@ const USAGE: &str = "usage: sport-stream <path-to-html>
        sport-stream <core-feed-file> --format flashscore --home-team <name> --away-team <name>
                     --stats-file <graphql-response.json> --stats-format json
                     --home-team-id <id> --away-team-id <id>   (statistics in the JSON format)
+       sport-stream stats --stats-url <url> [--json]   (print real statistics once, see below)
        sport-stream --url <core-url> --poll-seconds <N> --format flashscore ...
                     --stats-url <stats-feed-url>     (also fetch statistics in every poll)";
 
@@ -409,14 +416,65 @@ async fn poll(
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct StatsCommand {
+    url: String,
+    json: bool,
+}
+
+fn parse_stats_command(args: impl IntoIterator<Item = String>) -> Result<StatsCommand, String> {
+    let mut args = args.into_iter();
+    let (mut url, mut json) = (None, false);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--stats-url" => once(&mut url, &arg, text(&arg, args.next())?)?,
+            "--json" if !json => json = true,
+            "--json" => return Err(format!("--json given more than once\n{STATS_USAGE}")),
+            other => return Err(format!("unexpected argument {other}\n{STATS_USAGE}")),
+        }
+    }
+    Ok(StatsCommand {
+        url: url.ok_or(format!("--stats-url is required\n{STATS_USAGE}"))?,
+        json,
+    })
+}
+
+/// One GET, then the shared GraphQL parser. Returns the stats, the time the response was received
+/// and the HTTP status. Failed HTTP, GraphQL `errors` and an invalid payload are separate errors.
+async fn fetch_team_stats(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<(stats_graphql::TeamStats, DateTime<Utc>, u16), String> {
+    let (body, fetched_at, status) = source::fetch_url_with_status(client, url).await?;
+    let stats = stats_graphql::parse_stats_json_by_team(&body)
+        .map_err(|e| format!("cannot use the response from {url}: {e}"))?;
+    Ok((stats, fetched_at, status))
+}
+
+async fn run_stats(command: StatsCommand) -> Result<(), String> {
+    let client = source::build_client()?;
+    let (stats, fetched_at, status) = fetch_team_stats(&client, &command.url).await?;
+    if command.json {
+        println!("{}", stats_view::render_json(&stats, fetched_at, status)?);
+    } else {
+        print!("{}", stats_view::render_table(&stats, fetched_at, status));
+    }
+    Ok(())
+}
+
 async fn run() -> Result<(), String> {
+    let mut argv: Vec<String> = env::args().skip(1).collect();
+    if argv.first().map(String::as_str) == Some("stats") {
+        argv.remove(0);
+        return run_stats(parse_stats_command(argv)?).await;
+    }
     let Cli {
         input,
         format,
         stats_format,
         stats_file,
         stats_url,
-    } = parse_cli(env::args().skip(1))?;
+    } = parse_cli(argv)?;
     let (body, origin) = match input {
         Input::File(path) => (source::read_file(&path)?, path),
         Input::Url(url) => {
@@ -679,6 +737,116 @@ mod tests {
         ] {
             assert!(with(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn stats_command_arguments() {
+        let ok = parse_stats_command(args(&["--stats-url", "http://x/gql"])).unwrap();
+        assert_eq!(
+            ok,
+            StatsCommand {
+                url: "http://x/gql".into(),
+                json: false
+            }
+        );
+        let ok = parse_stats_command(args(&["--json", "--stats-url", "http://x/gql"])).unwrap();
+        assert!(ok.json);
+        for bad in [
+            &[][..],
+            &["--json"],
+            &["--stats-url"],
+            &["--stats-url", ""],
+            &["--stats-url", "a", "--stats-url", "b"],
+            &["--stats-url", "a", "--json", "--json"],
+            &["--stats-url", "a", "--bogus"],
+            &["file.txt"],
+        ] {
+            assert!(parse_stats_command(args(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    /// Serves one canned HTTP response on a local port; `None` accepts and never answers.
+    async fn serve_once(response: Option<(&'static str, String)>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/pq_graphql?_hash=dts",
+            listener.local_addr().unwrap()
+        );
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = socket.read(&mut buf).await;
+            match response {
+                Some((status, body)) => {
+                    let reply = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                }
+                None => tokio::time::sleep(Duration::from_secs(30)).await,
+            }
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn fetches_and_parses_the_local_graphql_fixture() {
+        let body = include_str!("../fixtures/flashscore/stats_graphql.json").to_string();
+        let url = serve_once(Some(("200 OK", body))).await;
+        let client = source::build_client().unwrap();
+        let (stats, _, status) = fetch_team_stats(&client, &url).await.unwrap();
+        assert_eq!(
+            (status, stats.entries, stats.teams.len(), stats.stages.len()),
+            (200, 19, 2, 2)
+        );
+    }
+
+    #[tokio::test]
+    async fn reports_http_graphql_and_payload_errors_readably() {
+        let client = source::build_client().unwrap();
+        let url = serve_once(Some(("503 Service Unavailable", "{}".into()))).await;
+        let e = fetch_team_stats(&client, &url).await.unwrap_err();
+        assert!(e.contains("returned HTTP status 503"), "{e}");
+
+        let gql = r#"{"errors":[{"message":"PersistedQueryNotFound"}],"data":null}"#;
+        let url = serve_once(Some(("200 OK", gql.into()))).await;
+        let e = fetch_team_stats(&client, &url).await.unwrap_err();
+        assert!(
+            e.contains("the source reported errors: PersistedQueryNotFound"),
+            "{e}"
+        );
+
+        let url = serve_once(Some(("200 OK", "<html>blocked</html>".into()))).await;
+        let e = fetch_team_stats(&client, &url).await.unwrap_err();
+        assert!(e.contains("invalid JSON"), "{e}");
+
+        let url = serve_once(Some((
+            "200 OK",
+            r#"{"data":{"findEventById":null}}"#.into(),
+        )))
+        .await;
+        let e = fetch_team_stats(&client, &url).await.unwrap_err();
+        assert!(e.contains("data.findEventById.teamStats.entries"), "{e}");
+
+        let e = fetch_team_stats(&client, "http://127.0.0.1:1/x")
+            .await
+            .unwrap_err();
+        assert!(e.contains("failed"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn times_out_instead_of_hanging() {
+        let url = serve_once(None).await;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(300))
+            .build()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let e = fetch_team_stats(&client, &url).await.unwrap_err();
+        assert!(e.contains("timed out"), "{e}");
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
